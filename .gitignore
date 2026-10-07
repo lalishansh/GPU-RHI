@@ -1,0 +1,17 @@
+*
+!*/
+.build/*
+
+!/.gitignore
+!/build.jai
+!/shell.nix
+!LICENSE
+
+# Example !
+!/src/**/*.jai
+
+# Lib/Module
+!/modules/*/**/*.*
+
+# assets
+!/assets/**/*.*
