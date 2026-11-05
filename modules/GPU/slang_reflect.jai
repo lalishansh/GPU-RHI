@@ -177,6 +177,18 @@ reflect_loaded_module :: (
     collect_from_program_layout(reflection, blueprint);
 }
 
+// Hull/domain/geometry (and incomplete stubs) can crash slang's
+// spReflectionEntryPoint_getParameterByIndex — skip param walk for those.
+reflect_stage_supports_params :: (stage: slang.SlangStage) -> bool {
+    if stage == {
+        case .VERTEX; #through;
+        case .FRAGMENT; #through;
+        case .COMPUTE;
+            return true;
+    }
+    return false;
+}
+
 collect_from_program_layout :: (reflection: *slang.SlangReflection, blueprint: *ShaderBlueprint) {
     ep_count := slang.spReflection_getEntryPointCount(reflection);
     for i: 0..ep_count-1 {
@@ -201,16 +213,18 @@ collect_from_program_layout :: (reflection: *slang.SlangReflection, blueprint: *
         outputs: [..]SlangVaryingType;
         uniforms: [..]SlangUniformType;
 
-        param_count := slang.spReflectionEntryPoint_getParameterCount(ep);
-        for p: 0..param_count-1 {
-            param := slang.spReflectionEntryPoint_getParameterByIndex(ep, p);
-            if !param continue;
-            collect_variable_layout(param, *inputs, *outputs, *uniforms, *blueprint.uniforms, stage);
-        }
+        if reflect_stage_supports_params(stage) {
+            param_count := slang.spReflectionEntryPoint_getParameterCount(ep);
+            for p: 0..param_count-1 {
+                param := slang.spReflectionEntryPoint_getParameterByIndex(ep, p);
+                if !param continue;
+                collect_variable_layout(param, *inputs, *outputs, *uniforms, *blueprint.uniforms, stage);
+            }
 
-        result_layout := slang.spReflectionEntryPoint_getResultVarLayout(ep);
-        if result_layout {
-            collect_variable_layout(result_layout, *inputs, *outputs, *uniforms, *blueprint.uniforms, stage);
+            result_layout := slang.spReflectionEntryPoint_getResultVarLayout(ep);
+            if result_layout {
+                collect_variable_layout(result_layout, *inputs, *outputs, *uniforms, *blueprint.uniforms, stage);
+            }
         }
 
         ep_info.inputs = inputs;
@@ -392,6 +406,7 @@ slang_stage_to_shader_type :: (stage: slang.SlangStage) -> SlangShaderType {
     case .VERTEX;   return .VERTEX_SHADER;
     case .FRAGMENT; return .FRAGMENT_SHADER;
     case .COMPUTE;  return .COMPUTE_SHADER;
+    // Hull/domain/geometry mapped as fragment only for bookkeeping; params are skipped.
     case;           return .FRAGMENT_SHADER;
     }
 }

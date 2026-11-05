@@ -9,7 +9,7 @@
 !LICENSE
 
 # Example !
-!/src/**/*.jai
+!/examples/**/*.jai
 
 # Lib/Module
 !/modules/*/**/*.*

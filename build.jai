@@ -3,9 +3,28 @@ BUILD_DIR :: ".bin/.build";
 ASSETS_DIR :: "assets";
 
 OUTPUT_EXECUTABLE_NAME :: "main";
-MINIMAL_CLI_EXECUTABLE_NAME :: "minimal-cli-host";
 ANDROID_APP_NAME :: "GPU-RHI Native";
 ANDROID_APP_ID   :: "jai.gpu_rhi_native";
+
+// Host example suite (NVRHI-style). Filter: jai build.jai - host 06_draw_geometry
+HOST_EXAMPLES :: string.[
+    "01_device_and_debug",
+    "02_surface",
+    "03_graphics_pipeline",
+    "04_resources",
+    "05_fill_resources",
+    "06_draw_geometry",
+    "07_headless",
+    "08_deferred",
+    "09_cubemaps",
+    "10_gpu_particles",
+    "11_threaded_rendering",
+    "12_shader_stages",
+    "13_slang_features",
+    "rt01_acceleration_structures",
+    "rt02_ray_pipelines",
+    "rt03_dispatch_rays",
+];
 
 #run {
     set_build_options_dc(.{do_output = false});
@@ -37,11 +56,13 @@ ANDROID_APP_ID   :: "jai.gpu_rhi_native";
     if target_count == 0 then wants_host = true;
 
     if wants_web {
-        build_web();
+        log_error("Web target parked until GPU backend rewrite. See FEATURES.md / __temp/.\n");
+        exit(1);
     } else if wants_android {
-        build_android(target_x64, target_arm, do_install);
+        log_error("Android target parked until GPU backend rewrite. See FEATURES.md / __temp/.\n");
+        exit(1);
     } else {
-        build_host();
+        build_host(args);
     }
 }
 
@@ -69,7 +90,7 @@ add_host_executable :: (workspace_name: string, source_file: string, executable_
     });
 }
 
-build_host :: () {
+build_host :: (args: [] string) {
     debug_targets: [..] Debug_Executable;
 
     if OS == .LINUX {
@@ -79,8 +100,27 @@ build_host :: () {
         }
     }
 
-    add_host_executable("Target Program", "src/main.jai", OUTPUT_EXECUTABLE_NAME, *debug_targets);
-    add_host_executable("Minimal CLI Host", "src/minimal-cli-host.jai", MINIMAL_CLI_EXECUTABLE_NAME, *debug_targets);
+    filter := "";
+    for args {
+        if it == "host" || it == "-host" || it == "web" || it == "-web" || it == "android" || it == "-android" continue;
+        if begins_with(it, "-") continue;
+        filter = it;
+        break;
+    }
+
+    built := 0;
+    for HOST_EXAMPLES {
+        if filter.count && filter != it continue;
+        source := tprint("examples/%/%.jai", it, it);
+        workspace := tprint("Example %", it);
+        add_host_executable(workspace, source, it, *debug_targets);
+        built += 1;
+    }
+    if !built {
+        log_error("No host examples matched filter '%'.\n", filter);
+        exit(1);
+    }
+    log("Building % host example(s).", built);
 
     copy_assets_to_out(ASSETS_DIR, string.[
         "display.py",
