@@ -159,7 +159,7 @@ struct VSOut { @builtin(position) pos: vec4f, @location(0) uv: vec2f }
   let x = f32(i32(vid & 1u) * 4 - 1);
   let y = f32(i32(vid >> 1u) * 4 - 1);
   o.pos = vec4f(x, y, 0.0, 1.0);
-  o.uv = vec2f((x + 1.0) * 0.5, (1.0 - y) * 0.5);
+  o.uv = vec2f((x + 1.0) * 0.5, (y + 1.0) * 0.5);
   return o;
 }
 @fragment fn fs_fullscreen(i: VSOut) -> @location(0) vec4f {

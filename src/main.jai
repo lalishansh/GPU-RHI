@@ -5,7 +5,7 @@ WINDOW_HEIGHT :: 1080;
 
 // Web has no ImGui static library. Linux uses the host archive; Android uses the NDK archives.
 #if OS == .WASM {
-    USE_IMGUI :: false;
+    USE_IMGUI :: true;
 } else {
     USE_IMGUI :: true;
 }
@@ -80,6 +80,7 @@ app_main :: () {
     y_posn := float.[0.0, -.5, 0.0, .5];
     y_posn_idx := 0;
     test_count := 0;
+    mouse_posn: [2]s32 = .[0, 0];
 
     quit := false;
     while !quit {
@@ -91,6 +92,7 @@ app_main :: () {
         #if USE_IMGUI {
             ImGui.SetCurrentContext(ui);
         }
+
         for PollWindowEvents(*w) {
             #if USE_IMGUI {
                 ImGuiBackend_ProcessEvent(it);
@@ -106,7 +108,7 @@ app_main :: () {
                     test_count += 1;
                     print("mouse click %\n", test_count);
                 }
-                else if it.mouse.type == .MOVE {print("mouse move %, %\n", it.mouse.posn[0], it.mouse.posn[1]);}
+                else if it.mouse.type == .MOVE {mouse_posn = it.mouse.posn; print("mouse move %, %\n", it.mouse.posn[0], it.mouse.posn[1]);}
             } else if it.kind == .TOUCH {
                 if it.touch.type == .TOUCH_START {
                     #if USE_IMGUI {
@@ -150,6 +152,78 @@ app_main :: () {
             while y_posn_idx >= y_posn.count {
                 y_posn_idx -= y_posn.count;
             }
+            ImGui.Text("mouse_posn %, %", mouse_posn[0], mouse_posn[1]);
+            ImGui.Text("win_w %, win_h %", w.width, w.height);
+            ImGui.Text("tex_w %, tex_h %", tex.size.width, tex.size.height);
+            ImGui.TextUnformatted("lorem");
+            ImGui.TextUnformatted("ipsum");
+            ImGui.TextUnformatted("dolor");
+            ImGui.TextUnformatted("sit");
+            ImGui.TextUnformatted("amet");
+            ImGui.TextUnformatted("consectetur");
+            ImGui.TextUnformatted("adipiscing");
+            ImGui.TextUnformatted("elit");
+            ImGui.TextUnformatted("sed");
+            ImGui.TextUnformatted("do");
+            ImGui.TextUnformatted("eiusmod");
+            ImGui.TextUnformatted("tempor");
+            ImGui.TextUnformatted("incididunt");
+            ImGui.TextUnformatted("ut");
+            ImGui.TextUnformatted("labore");
+            ImGui.TextUnformatted("et");
+            ImGui.TextUnformatted("dolore");
+            ImGui.TextUnformatted("magna");
+            ImGui.TextUnformatted("aliqua.");
+            ImGui.TextUnformatted("Ut");
+            ImGui.TextUnformatted("enim");
+            ImGui.TextUnformatted("ad");
+            ImGui.TextUnformatted("minim");
+            ImGui.TextUnformatted("veniam,");
+            ImGui.TextUnformatted("quis");
+            ImGui.TextUnformatted("nostrud");
+            ImGui.TextUnformatted("exercitation");
+            ImGui.TextUnformatted("ullamco");
+            ImGui.TextUnformatted("laboris");
+            ImGui.TextUnformatted("nisi");
+            ImGui.TextUnformatted("ut");
+            ImGui.TextUnformatted("aliquip");
+            ImGui.TextUnformatted("ex");
+            ImGui.TextUnformatted("ea");
+            ImGui.TextUnformatted("commodo");
+            ImGui.TextUnformatted("consequat.");
+            ImGui.TextUnformatted("Duis");
+            ImGui.TextUnformatted("aute");
+            ImGui.TextUnformatted("irure");
+            ImGui.TextUnformatted("dolor");
+            ImGui.TextUnformatted("in");
+            ImGui.TextUnformatted("reprehenderit");
+            ImGui.TextUnformatted("in");
+            ImGui.TextUnformatted("voluptate");
+            ImGui.TextUnformatted("velit");
+            ImGui.TextUnformatted("esse");
+            ImGui.TextUnformatted("cillum");
+            ImGui.TextUnformatted("dolore");
+            ImGui.TextUnformatted("eu");
+            ImGui.TextUnformatted("fugiat");
+            ImGui.TextUnformatted("nulla");
+            ImGui.TextUnformatted("pariatur.");
+            ImGui.TextUnformatted("Excepteur");
+            ImGui.TextUnformatted("sint");
+            ImGui.TextUnformatted("occaecat");
+            ImGui.TextUnformatted("cupidatat");
+            ImGui.TextUnformatted("non");
+            ImGui.TextUnformatted("proident,");
+            ImGui.TextUnformatted("sunt");
+            ImGui.TextUnformatted("in");
+            ImGui.TextUnformatted("culpa");
+            ImGui.TextUnformatted("qui");
+            ImGui.TextUnformatted("officia");
+            ImGui.TextUnformatted("deserunt");
+            ImGui.TextUnformatted("mollit");
+            ImGui.TextUnformatted("anim");
+            ImGui.TextUnformatted("id");
+            ImGui.TextUnformatted("est");
+            ImGui.TextUnformatted("laborum.");
             ImGui.End();
             ImGui.Render();
         }
@@ -167,14 +241,10 @@ app_main :: () {
             // resumes once the frame budget for `fps` has elapsed.
             Present(*srf, *tex, fps = 60);
             #if USE_IMGUI {
-                win_w: s32 = cast(s32) w.width;
-                win_h: s32 = cast(s32) w.height;
-                #if OS == .LINUX {
-                    Window :: #import "Window_Creation";
-                    _, _, win_w, win_h = Window.get_dimensions(srf.window.host, false);
-                }
-                if win_w > 0 && win_h > 0 && (tex.size.width != cast(u32) win_w || tex.size.height != cast(u32) win_h) {
-                    Update(*tex, Size2D.{xx win_w, xx win_h});
+                _, _, win_w, win_h, dim_ok := GetDimensions(srf.window);
+                if dim_ok print("win_w %, win_h %\n", win_w, win_h);
+                if dim_ok && (tex.size.width != win_w || tex.size.height != win_h) {
+                    Update(*tex, Size2D.{win_w, win_h});
                     aspect := cast(float) tex.size.width / cast(float) tex.size.height;
                     half_h := tan(fov * 0.5) * z_near;
                     half_w := half_h * aspect;

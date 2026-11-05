@@ -1,10 +1,11 @@
 *
 !*/
 .build/*
+/__*/
 
 !/.gitignore
 !/build.jai
-!/shell.nix
+!/flake.nix
 !LICENSE
 
 # Example !

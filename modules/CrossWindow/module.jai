@@ -111,6 +111,23 @@ CrossWindow :: (wd: u32, ht: u32, name_id := "app") -> CrossWindowType {
     return w;
 }
 
+GetDimensions :: (window: *CrossWindowType) -> (x: s32, y: s32, width: u32, height: u32, success := true) {
+    #if OS == .WASM {
+        if window.name_id.count == 0 return 0, 0, 0, 0, false;
+        cx: s32;
+        cy: s32;
+        cw, ch: u32;
+        ok := jsGetCanvasRect(window.name_id.data, xx window.name_id.count, *cx, *cy, *cw, *ch);
+        if ok == 0 || cw == 0 || ch == 0 return cx, cy, 0, 0, false;
+        return cx, cy, cw, ch, true;
+    } else {
+        if window.host == HostWindow.WT.INVALID_WINDOW return 0, 0, 0, 0, false;
+        hx, hy, hw, hh := HostWindow.get_dimensions(window.host, false);
+        if hw <= 0 || hh <= 0 return hx, hy, 0, 0, false;
+        return hx, hy, cast(u32) hw, cast(u32) hh, true;
+    }
+}
+
 PollWindowEvents :: (window: *CrossWindowType) -> []CrossEvent {
     array_reset(*window.events);
 
@@ -228,6 +245,13 @@ PollWindowEvents :: (window: *CrossWindowType) -> []CrossEvent {
                 }
             }
         }
+    }
+
+    _, _, dw, dh, dim_ok := GetDimensions(window);
+    if dim_ok && (dw != window.width || dh != window.height) {
+        window.width = dw;
+        window.height = dh;
+        push_window(window, .RESIZE, dw, dh);
     }
 
     return window.events;
@@ -358,4 +382,6 @@ host_is_mouse_button :: (code: HostInput.Key_Code) -> bool {
     jsEnsureCanvas :: (id_data: *u8, id_count: s64, w: u32, h: u32) #foreign;
     // kind, subtype, i0, i1, i2, pressure. Returns 1 when an event was written.
     jsPollInputEvent :: (out_kind: *s32, out_type: *s32, out_i0: *s32, out_i1: *s32, out_i2: *s32, out_pressure: *float32) -> s32 #foreign;
+    // Canvas backing-store size plus viewport origin. Returns 1 when the canvas exists.
+    jsGetCanvasRect :: (id_data: *u8, id_count: s64, x: *s32, y: *s32, width: *u32, height: *u32) -> s32 #foreign;
 }

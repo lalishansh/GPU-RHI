@@ -31,10 +31,10 @@ HTML = """<!DOCTYPE html>
     :root { color-scheme: dark; }
     html, body { margin: 0; height: 100%; background: #111; color: #ccc;
       font: 14px/1.4 ui-sans-serif, system-ui, sans-serif; }
-    #wrap { min-height: 100%; display: grid; place-items: center; gap: 0.75rem; }
-    canvas { display: block; background: #000; border: 1px solid #333;
-      max-width: 100%; image-rendering: pixelated; }
-    #status { opacity: 0.7; }
+    #wrap { height: 100%; display: flex; flex-direction: column; }
+    canvas { display: block; flex: 1 1 auto; width: 100%; min-height: 0;
+      background: #000; image-rendering: pixelated; }
+    #status { opacity: 0.7; padding: 0.35rem 0.75rem; }
   </style>
 </head>
 <body>

@@ -73,6 +73,9 @@ ImGuiBackend_RenderDrawData :: (q: *GPU.WebGpuQueue, draw_data: *ImGui.ImDrawDat
     fb_w := cast(float) fb.textures[0].size.width;
     fb_h := cast(float) fb.textures[0].size.height;
 
+    // Same projection as Vulkan: ImGui Y-down maps to NDC -1 at the top of the widget.
+    // WebGPU stores that at the bottom of the texture. Present UV (y+1)*0.5
+    // shows that edge at the top of the canvas, so the panel reads upright.
     scale_x := 2.0 / draw_data.DisplaySize.x;
     scale_y := 2.0 / draw_data.DisplaySize.y;
     pc := float.[
@@ -109,16 +112,30 @@ ImGuiBackend_RenderDrawData :: (q: *GPU.WebGpuQueue, draw_data: *ImGui.ImDrawDat
             if !font continue;
             GPU.jsSetBindGroup(0, font.bind_group);
 
-            clip_x := pcmd.ClipRect.x - draw_data.DisplayPos.x;
-            clip_y := pcmd.ClipRect.y - draw_data.DisplayPos.y;
-            clip_z := pcmd.ClipRect.z - draw_data.DisplayPos.x;
-            clip_w := pcmd.ClipRect.w - draw_data.DisplayPos.y;
-            if clip_x < 0 clip_x = 0;
-            if clip_y < 0 clip_y = 0;
-            if clip_z > fb_w clip_z = fb_w;
-            if clip_w > fb_h clip_w = fb_h;
-            if clip_z <= clip_x || clip_w <= clip_y continue;
-            jsSetScissor(cast(s32) clip_x, cast(s32) clip_y, cast(u32) (clip_z - clip_x), cast(u32) (clip_w - clip_y));
+            // Clip rects are Y-down. The projection mirrors them into the texture,
+            // so the scissor (texture top-left) uses the mirrored Y.
+            to_fb_x := fb_w / draw_data.DisplaySize.x;
+            to_fb_y := fb_h / draw_data.DisplaySize.y;
+            clip_x := (pcmd.ClipRect.x - draw_data.DisplayPos.x) * to_fb_x;
+            clip_y := (pcmd.ClipRect.y - draw_data.DisplayPos.y) * to_fb_y;
+            clip_z := (pcmd.ClipRect.z - draw_data.DisplayPos.x) * to_fb_x;
+            clip_w := (pcmd.ClipRect.w - draw_data.DisplayPos.y) * to_fb_y;
+            scissor_x := clip_x;
+            scissor_y := fb_h - clip_w;
+            scissor_w := clip_z - clip_x;
+            scissor_h := clip_w - clip_y;
+            if scissor_x < 0 {
+                scissor_w += scissor_x;
+                scissor_x = 0;
+            }
+            if scissor_y < 0 {
+                scissor_h += scissor_y;
+                scissor_y = 0;
+            }
+            if scissor_x + scissor_w > fb_w scissor_w = fb_w - scissor_x;
+            if scissor_y + scissor_h > fb_h scissor_h = fb_h - scissor_y;
+            if scissor_w <= 0 || scissor_h <= 0 continue;
+            jsSetScissor(cast(s32) scissor_x, cast(s32) scissor_y, cast(u32) scissor_w, cast(u32) scissor_h);
             jsDrawIndexedRange(pcmd.ElemCount, pcmd.IdxOffset, cast(s32) pcmd.VtxOffset);
         }
     }

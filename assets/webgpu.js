@@ -52,10 +52,23 @@ window.__native_webgpu = {
   },
 };
 
+function sync_canvas_backing_store(canvas) {
+  // canvas.width is the bitmap GetDimensions reads. CSS size alone does not change it.
+  const w = Math.max(1, canvas.clientWidth);
+  const h = Math.max(1, canvas.clientHeight);
+  if (canvas.width !== w) canvas.width = w;
+  if (canvas.height !== h) canvas.height = h;
+}
+
 function bind_canvas_input(canvas) {
   if (canvas.__input_bound) return;
   canvas.__input_bound = true;
   canvas.tabIndex = 0;
+  canvas.style.width = "100%";
+  canvas.style.height = "100%";
+  const observer = new ResizeObserver(() => sync_canvas_backing_store(canvas));
+  observer.observe(canvas);
+  sync_canvas_backing_store(canvas);
 
   const local_xy = (e) => {
     const r = canvas.getBoundingClientRect();
@@ -127,10 +140,6 @@ const webgpu_imports = {
       const wrap = document.getElementById("wrap") || document.body;
       wrap.insertBefore(canvas, wrap.firstChild);
     }
-    canvas.width = Number(w);
-    canvas.height = Number(h);
-    canvas.style.width = `${Number(w)}px`;
-    canvas.style.height = `${Number(h)}px`;
     bind_canvas_input(canvas);
   },
 
@@ -144,6 +153,19 @@ const webgpu_imports = {
     mem.setInt32(Number(out_i1), ev.i1 | 0, true);
     mem.setInt32(Number(out_i2), ev.i2 | 0, true);
     mem.setFloat32(Number(out_f), ev.f || 0, true);
+    return 1;
+  },
+
+  jsGetCanvasRect: (id_ptr, id_len, out_x, out_y, out_w, out_h) => {
+    const id = read_str(id_ptr, id_len);
+    const canvas = document.getElementById(id);
+    if (!canvas || !wasm_memory) return 0;
+    const r = canvas.getBoundingClientRect();
+    const mem = new DataView(wasm_memory.buffer);
+    mem.setInt32(Number(out_x), Math.round(r.left), true);
+    mem.setInt32(Number(out_y), Math.round(r.top), true);
+    mem.setUint32(Number(out_w), canvas.width >>> 0, true);
+    mem.setUint32(Number(out_h), canvas.height >>> 0, true);
     return 1;
   },
 
@@ -167,8 +189,9 @@ const webgpu_imports = {
       u |= GPUBufferUsage.VERTEX;
     }
     u |= GPUBufferUsage.COPY_DST;
+    // writeBuffer requires the byte count to be a multiple of 4.
     const buf = gpu_device.createBuffer({
-      size: Number(size),
+      size: (Number(size) + 3) & ~3,
       usage: u,
       mappedAtCreation: Number(data_len) > 0,
     });
@@ -205,7 +228,17 @@ const webgpu_imports = {
 
   jsWriteBuffer: (buf_handle, offset, data_ptr, data_len) => {
     const buf = get_object(buf_handle);
-    gpu_queue.writeBuffer(buf, Number(offset), read_u8_array(data_ptr, data_len));
+    const len = Number(data_len);
+    const src = read_u8_array(data_ptr, len);
+    // GPUQueue.writeBuffer rejects a size that is not a multiple of 4.
+    // ImGui index lists are u16, so the live byte count is often 2 mod 4.
+    const padded = (len + 3) & ~3;
+    let data = src;
+    if (padded !== len) {
+      data = new Uint8Array(padded);
+      data.set(src);
+    }
+    gpu_queue.writeBuffer(buf, Number(offset), data);
   },
 
   jsCreateRenderPipeline: (
@@ -435,7 +468,7 @@ const webgpu_imports = {
 
   jsCreateRawBuffer: (size, usage) => {
     const buf = gpu_device.createBuffer({
-      size: Number(size),
+      size: (Number(size) + 3) & ~3,
       usage: Number(usage) | GPUBufferUsage.COPY_DST,
     });
     return add_object(buf);
