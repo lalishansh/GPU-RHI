@@ -1,5 +1,12 @@
 // NVRHI-style: Filling resource data
-main :: () {
+#if OS == .WASM {
+    #program_export
+    main :: () { fill_resources_main(); }
+} else {
+    main :: () { fill_resources_main(); }
+}
+
+fill_resources_main :: () {
     ctx := Context(flags = .ENABLE_DEBUG);
     defer Destroy(*ctx);
     dev := Device(*ctx);
@@ -20,7 +27,7 @@ main :: () {
     tex := Texture(*dev, Size2D.{4, 4}, locality = .CREATE_ON_HOST);
     defer Destroy(*tex);
     pixels: [4*4*4] u8;
-    for 0..pixels.count-1 pixels[it] = cast(u8) (it * 17);
+    for 0..pixels.count-1 pixels[it] = cast(u8) ((it * 17) & 0xFF);
     Update(*tex, pixels);
 
     print("filled vbo (% bytes) and %x% texture\n", vbo.size, tex.size.x, tex.size.y);

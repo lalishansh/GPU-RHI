@@ -2,7 +2,14 @@
 WINDOW_W :: 1280;
 WINDOW_H :: 720;
 
-main :: () {
+#if OS == .WASM {
+    #program_export
+    main :: () { draw_geometry_main(); }
+} else {
+    main :: () { draw_geometry_main(); }
+}
+
+draw_geometry_main :: () {
     #if OS == .LINUX {
         path := path_strip_filename(get_path_of_running_executable());
         set_working_directory(path);
@@ -71,18 +78,26 @@ main :: () {
     }
     Submit(*q, wait = true);
 
-    bytes := Get(*tex);
-    defer free(bytes.data);
-    write_to_image(bytes, "06_draw_geometry.ppm", WINDOW_W, WINDOW_H);
+    #if OS != .WASM {
+        bytes := Get(*tex);
+        defer free(bytes.data);
+        write_to_image(bytes, "06_draw_geometry.ppm", WINDOW_W, WINDOW_H);
+    } else {
+        print("06_draw_geometry: rendered %x% (no PPM on WASM)\n", WINDOW_W, WINDOW_H);
+    }
 }
 
 #import "Basic";
-#import "File";
 #import "Math";
 #import "String";
 #import "GPU";
+#if OS != .WASM {
+    #import "File";
+}
 #if OS == .LINUX {
     #import "System";
 }
-#load "../_common/ppm.jai";
+#if OS != .WASM {
+    #load "../_common/ppm.jai";
+}
 #load "../_common/shaders.jai";

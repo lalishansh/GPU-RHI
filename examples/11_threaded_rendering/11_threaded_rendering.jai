@@ -8,8 +8,8 @@ main :: () {
     THREADS :: 4;
     for 0..THREADS-1 {
         q := Queue(*dev, .GRAPHICS);
+        defer Destroy(*q);
         print("thread-slot % → graphics queue (api from Device)\n", it);
-        _ := q;
     }
     print("threaded_rendering: % typed graphics queues\n", THREADS);
 }

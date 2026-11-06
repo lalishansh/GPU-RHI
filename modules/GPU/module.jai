@@ -1,13 +1,16 @@
-// GPU module — shared facade types + Vulkan host backend (Phase 2 headless).
+// GPU module — shared facade types + Vulkan host backend.
 // Defaults always provided (never null optionals); DbC; reflection-first; static-first.
-// WebGPU / CrossWindow / Surface deferred.
 
 #import "Basic";
 #import "Math";
 #import "String";
+#import "CrossWindow";
 
 #if OS != .WASM {
     #import "Vulkan";
+    #if OS == .LINUX {
+        X11 :: #import "X11";
+    }
     #if OS != .ANDROID {
         slang :: #import "slang";
     }
@@ -183,8 +186,7 @@ ray_tracing_not_ready :: (feature_name: string, loc := #caller_location) {
 }
 
 #if OS == .WASM {
-    // WebGPU backend deferred — Phase 2 is Vulkan host headless.
-    #assert false;
+    #load "webgpu.jai";
 } else {
     #load "slang_reflect.jai";
     #load "vulkan.jai";

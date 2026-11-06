@@ -10,6 +10,7 @@ ANDROID_APP_ID   :: "jai.gpu_rhi_native";
 HOST_EXAMPLES :: string.[
     "01_device_and_debug",
     "02_surface",
+    "02b_multiwindow",
     "03_graphics_pipeline",
     "04_resources",
     "05_fill_resources",
@@ -24,6 +25,18 @@ HOST_EXAMPLES :: string.[
     "rt01_acceleration_structures",
     "rt02_ray_pipelines",
     "rt03_dispatch_rays",
+];
+
+// Web examples (filter: jai build.jai - web 02_surface). Emits .bin/<name>.js with embedded wasm.
+WEB_EXAMPLES :: string.[
+    "01_device_and_debug",
+    "02_surface",
+    "02b_multiwindow",
+    "03_graphics_pipeline",
+    "04_resources",
+    "05_fill_resources",
+    "06_draw_geometry",
+    "07_headless",
 ];
 
 #run {
@@ -56,8 +69,7 @@ HOST_EXAMPLES :: string.[
     if target_count == 0 then wants_host = true;
 
     if wants_web {
-        log_error("Web target parked until GPU backend rewrite. See FEATURES.md / __temp/.\n");
-        exit(1);
+        build_web(args);
     } else if wants_android {
         log_error("Android target parked until GPU backend rewrite. See FEATURES.md / __temp/.\n");
         exit(1);
@@ -237,8 +249,24 @@ generate_vscode_gdb_debug_tasks :: (targets: [] Debug_Executable) {
     }
 }
 
-build_web :: () {
-    w := compiler_create_workspace("Native WASM");
+build_web_example_filter :: (args: [] string) -> string {
+    for args {
+        if it == "host" || it == "-host" || it == "web" || it == "-web" || it == "android" || it == "-android" continue;
+        if begins_with(it, "-") continue;
+        return it;
+    }
+    return "";
+}
+
+build_one_web_example :: (example: string) -> bool {
+    source := tprint("examples/%/%.jai", example, example);
+    if !file_exists(source) {
+        log_error("Missing example source: %\n", source);
+        return false;
+    }
+
+    workspace := tprint("Web %", example);
+    w := compiler_create_workspace(workspace);
     options := get_build_options(w);
     copy_commonly_propagated_fields(get_build_options(), *options);
 
@@ -249,44 +277,109 @@ build_web :: () {
     options.emit_debug_info = .DWARF;
     options.backtrace_on_crash = .OFF;
     options.output_path = OUT_DIR;
-    options.intermediate_path = BUILD_DIR;
-    options.output_executable_name = OUTPUT_EXECUTABLE_NAME;
+    options.intermediate_path = tprint("%/%", BUILD_DIR, example);
+    options.output_executable_name = example;
     options.llvm_options.target_system_features = "+bulk-memory";
     options.llvm_options.enable_split_modules = false;
     options.llvm_options.function_sections = true;
 
-    // Prefer patched modules tree when present (Nix store modules are read-only).
     patched_modules := tprint("%/../../Jai-Compiler/modules", get_working_directory());
     use_patched_modules := file_exists(patched_modules);
-    if use_patched_modules log("Will use patched modules at %", patched_modules);
 
     import_paths: [..]string;
     array_add(*import_paths, tprint("%/modules", #filepath));
     if use_patched_modules array_add(*import_paths, patched_modules);
-    for options.import_path array_add(*import_paths, it);
+    for get_build_options().import_path array_add(*import_paths, it);
     options.import_path = import_paths;
 
     walloc_path := tprint("%/walloc.o", ASSETS_DIR);
-    // ImGui's wasm64 archive calls sinf/qsort/vsnprintf/…. walloc only covers malloc.
     wasm_libc_path := tprint("%/wasm_libc.o", ASSETS_DIR);
     STACK_SIZE :: 1024 * 1024;
     options.additional_linker_arguments = .[
         "--stack-first",
         "-z", tprint("stack-size=%", STACK_SIZE),
         "--export-table",
+        "--export=main",
         walloc_path,
         wasm_libc_path,
     ];
 
     set_build_options(options, w);
     remap_import(w, "*", "Default_Allocator", "Walloc");
-    add_build_file("src/main.jai", w);
+
+    compiler_begin_intercept(w);
+    add_build_file(source, w);
+
+    ok := true;
+    while true {
+        message := compiler_wait_for_message();
+        if message.kind == {
+            case .COMPLETE;
+                mc := cast(*Message_Complete) message;
+                if mc.error_code != .NONE {
+                    ok = false;
+                    log_error("Web build failed for % (error %)\n", example, mc.error_code);
+                }
+                break;
+        }
+    }
+    compiler_end_intercept(w);
+    if !ok return false;
+
+    wasm_path := tprint("%/%.wasm", OUT_DIR, example);
+    bare := tprint("%/%", OUT_DIR, example);
+    if !file_exists(wasm_path) && file_exists(bare) {
+        copy_file(bare, wasm_path);
+    }
+    if !file_exists(wasm_path) {
+        log_error("Expected wasm at % after build\n", wasm_path);
+        return false;
+    }
+
+    js_out := tprint("%/%.js", OUT_DIR, example);
+    Process :: #import "Process";
+    result, stdout, stderr := Process.run_command(
+        "python3",
+        tprint("%/embed_example_js.py", ASSETS_DIR),
+        "--webgpu", tprint("%/webgpu.js", ASSETS_DIR),
+        "--wasm", wasm_path,
+        "--out", js_out,
+        "--name", example,
+        capture_and_return_output = true,
+    );
+    if result.type == .FAILED_TO_LAUNCH || result.exit_code != 0 {
+        log_error("embed_example_js failed for %:\n%\n%\n", example, stdout, stderr);
+        return false;
+    }
+    log("Embedded %", js_out);
+    return true;
+}
+
+build_web :: (args: [] string) {
+    make_directory_if_it_does_not_exist(OUT_DIR);
+    make_directory_if_it_does_not_exist(BUILD_DIR, recursive = true);
+
+    patched_modules := tprint("%/../../Jai-Compiler/modules", get_working_directory());
+    if file_exists(patched_modules) log("Will use patched modules at %", patched_modules);
+
+    filter := build_web_example_filter(args);
+    built := 0;
+    for WEB_EXAMPLES {
+        if filter.count && filter != it continue;
+        if build_one_web_example(it) built += 1;
+        else exit(1);
+    }
+    if !built {
+        log_error("No web examples matched filter '%'.\n", filter);
+        exit(1);
+    }
+    log("Building % web example(s) → self-contained .js", built);
 
     copy_assets_to_out(ASSETS_DIR, string.[
-        "runtime.js",
         "serve.py",
-        "walloc.o",
+        "embed_example_js.py",
         "webgpu.js",
+        "runtime.js",
     ]);
 }
 

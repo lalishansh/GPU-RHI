@@ -12,10 +12,10 @@ main :: () {
     depth := Texture(*dev, Size2D.{1280, 720}, format = .D32_SFLOAT, usage = .DEPTH_STENCIL);
     defer Destroy(*depth);
 
-    gbuffer := FrameBuffer(*albedo, *normals, depth_texture = *depth);
+    gbuffer := FrameBuffer(.[*albedo, *normals], depth_texture = *depth);
     defer Destroy(*gbuffer);
 
-    print("Deferred G-buffer: VulkanFrameBuffer(2, has_external_depth=true)\n");
+    print("Deferred G-buffer: FrameBuffer(.[albedo, normals], depth_texture)\n");
 }
 
 #import "Basic";

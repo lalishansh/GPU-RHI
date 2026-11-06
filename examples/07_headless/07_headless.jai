@@ -1,5 +1,12 @@
-// Headless offscreen render → PPM
-main :: () {
+// Headless offscreen render → PPM (host) / draw-only (WASM)
+#if OS == .WASM {
+    #program_export
+    main :: () { headless_main(); }
+} else {
+    main :: () { headless_main(); }
+}
+
+headless_main :: () {
     #if OS == .LINUX {
         path := path_strip_filename(get_path_of_running_executable());
         set_working_directory(path);
@@ -36,17 +43,25 @@ main :: () {
     }
     Submit(*q, wait = true);
 
-    bytes := Get(*tex); defer free(bytes.data);
-    write_to_image(bytes, "07_headless.ppm", tex.size.x, tex.size.y);
+    #if OS != .WASM {
+        bytes := Get(*tex); defer free(bytes.data);
+        write_to_image(bytes, "07_headless.ppm", tex.size.x, tex.size.y);
+    } else {
+        print("07_headless: rendered %x% (no PPM on WASM)\n", tex.size.x, tex.size.y);
+    }
 }
 
 #import "Basic";
-#import "File";
 #import "Math";
 #import "String";
 #import "GPU";
+#if OS != .WASM {
+    #import "File";
+}
 #if OS == .LINUX {
     #import "System";
 }
-#load "../_common/ppm.jai";
+#if OS != .WASM {
+    #load "../_common/ppm.jai";
+}
 #load "../_common/shaders.jai";

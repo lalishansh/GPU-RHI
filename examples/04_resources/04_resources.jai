@@ -1,5 +1,12 @@
 // NVRHI-style: Creating resources (2D / 3D / Cube + buffers)
-main :: () {
+#if OS == .WASM {
+    #program_export
+    main :: () { resources_main(); }
+} else {
+    main :: () { resources_main(); }
+}
+
+resources_main :: () {
     ctx := Context(flags = .ENABLE_DEBUG);
     defer Destroy(*ctx);
     dev := Device(*ctx);

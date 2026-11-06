@@ -52,12 +52,28 @@ window.__native_webgpu = {
   },
 };
 
+function reconfigure_canvas_context(canvas) {
+  // Setting canvas.width/height invalidates the GPUCanvasContext — reconfigure
+  // immediately so Present/getCurrentTexture does not go black until the next frame.
+  if (!canvas.__gpu_ctx || !gpu_device) return;
+  const format = canvas.__gpu_format || navigator.gpu.getPreferredCanvasFormat();
+  canvas.__gpu_ctx.configure({
+    device: gpu_device,
+    format,
+    alphaMode: "opaque",
+    usage: GPUTextureUsage.RENDER_ATTACHMENT,
+  });
+}
+
 function sync_canvas_backing_store(canvas) {
   // canvas.width is the bitmap GetDimensions reads. CSS size alone does not change it.
-  const w = Math.max(1, canvas.clientWidth);
-  const h = Math.max(1, canvas.clientHeight);
-  if (canvas.width !== w) canvas.width = w;
-  if (canvas.height !== h) canvas.height = h;
+  const w = Math.max(1, canvas.clientWidth | 0);
+  const h = Math.max(1, canvas.clientHeight | 0);
+  if (canvas.width === w && canvas.height === h) return;
+  canvas.width = w;
+  canvas.height = h;
+  reconfigure_canvas_context(canvas);
+  window.__native_webgpu.push_resize(canvas.id, w, h);
 }
 
 function bind_canvas_input(canvas) {
@@ -140,6 +156,9 @@ const webgpu_imports = {
       const wrap = document.getElementById("wrap") || document.body;
       wrap.insertBefore(canvas, wrap.firstChild);
     }
+    const ww = Number(w), hh = Number(h);
+    if (ww > 0) canvas.width = ww;
+    if (hh > 0) canvas.height = hh;
     bind_canvas_input(canvas);
   },
 
@@ -213,9 +232,37 @@ const webgpu_imports = {
     return add_object(tex);
   },
 
+  jsWriteTexture: (tex_handle, width, height, data_ptr, data_len) => {
+    const tex = get_object(tex_handle);
+    const w = Number(width);
+    const h = Number(height);
+    gpu_queue.writeTexture(
+      { texture: tex },
+      read_u8_array(data_ptr, data_len),
+      { bytesPerRow: w * 4 },
+      { width: w, height: h },
+    );
+  },
+
   jsCreateShaderModule: (code_ptr, code_len) => {
     const code = read_str(code_ptr, code_len);
-    return add_object(gpu_device.createShaderModule({ code }));
+    const mod = gpu_device.createShaderModule({ code });
+    // Surface compilation errors early (Chrome reports them async otherwise).
+    if (mod.getCompilationInfo) {
+      mod.getCompilationInfo().then((info) => {
+        for (const m of info.messages) {
+          const fn = m.type === "error" ? console.error : console.warn;
+          fn(`WGSL ${m.type}: ${m.message} @${m.lineNum}:${m.linePos}`);
+          if (m.type === "error") {
+            const lines = code.split("\n");
+            const start = Math.max(0, (m.lineNum || 1) - 2);
+            const end = Math.min(lines.length, (m.lineNum || 1) + 1);
+            fn(lines.slice(start, end).map((l, i) => `${start + i + 1}| ${l}`).join("\n"));
+          }
+        }
+      });
+    }
+    return add_object(mod);
   },
 
   jsCreateUniformBuffer: (size) => {
@@ -250,11 +297,16 @@ const webgpu_imports = {
   ) => {
     const vsEntry = read_str(vs_entry_ptr, vs_entry_len);
     const fsEntry = read_str(fs_entry_ptr, fs_entry_len);
+    // Vertex_t layout: Pos(0) Color(12) Normal(24) — always expose all three locations
+    // so slangc WGSL inputs match even when a stage ignores Normal.
     const buffers = [{
       arrayStride: Number(stride),
       attributes: [
         { shaderLocation: 0, offset: 0, format: "float32x3" },
-        ...(Number(has_color_attr) ? [{ shaderLocation: 1, offset: 12, format: "float32x3" }] : []),
+        ...(Number(has_color_attr) ? [
+          { shaderLocation: 1, offset: 12, format: "float32x3" },
+          { shaderLocation: 2, offset: 24, format: "float32x3" },
+        ] : []),
       ],
     }];
     const layout = Number(bind_group_layout_handle)
@@ -354,19 +406,20 @@ const webgpu_imports = {
   jsConfigureSurface: (surface_handle, width, height) => {
     const canvas = get_object(surface_handle);
     const format = navigator.gpu.getPreferredCanvasFormat();
-    canvas.width = Number(width);
-    canvas.height = Number(height);
-    const ctx = canvas.getContext("webgpu");
+    const w = Math.max(1, Number(width) | 0);
+    const h = Math.max(1, Number(height) | 0);
+    if (canvas.width !== w) canvas.width = w;
+    if (canvas.height !== h) canvas.height = h;
+    const ctx = canvas.__gpu_ctx || canvas.getContext("webgpu");
     ctx.configure({
       device: gpu_device,
       format,
       alphaMode: "opaque",
       usage: GPUTextureUsage.RENDER_ATTACHMENT,
     });
-    // stash context on canvas
     canvas.__gpu_ctx = ctx;
     canvas.__gpu_format = format;
-    return add_object(ctx);
+    return canvas.__gpu_ctx_handle || (canvas.__gpu_ctx_handle = add_object(ctx));
   },
 
   jsGetPreferredSwapFormat: (out_ptr, out_cap) => {

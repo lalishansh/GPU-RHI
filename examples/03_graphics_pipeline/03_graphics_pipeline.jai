@@ -1,5 +1,12 @@
 // NVRHI-style: Graphics pipeline (embedded shader + pass)
-main :: () {
+#if OS == .WASM {
+    #program_export
+    main :: () { graphics_pipeline_main(); }
+} else {
+    main :: () { graphics_pipeline_main(); }
+}
+
+graphics_pipeline_main :: () {
     ctx := Context(flags = .ENABLE_DEBUG);
     defer Destroy(*ctx);
     dev := Device(*ctx);

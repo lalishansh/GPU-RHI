@@ -16,6 +16,23 @@ SlangShaderType :: enum u8 {
     COMPUTE_SHADER;
     VERTEX_SHADER;
     FRAGMENT_SHADER;
+    HULL_SHADER;
+    DOMAIN_SHADER;
+    GEOMETRY_SHADER;
+};
+
+SlangResourceKind :: enum u8 {
+    STORAGE_BUFFER;
+    SAMPLED_TEXTURE;
+    STORAGE_TEXTURE;
+    SAMPLER;
+};
+
+SlangResourceBinding :: struct {
+    name: string;
+    set: u32;
+    binding: u32;
+    kind: SlangResourceKind;
 };
 
 SlangShaderEntryPointType :: struct {
@@ -30,6 +47,7 @@ SlangShaderEntryPointType :: struct {
 ShaderBlueprint :: struct {
     entry_points: [..]SlangShaderEntryPointType;
     uniforms: [..]SlangUniformType;
+    resources: [..]SlangResourceBinding;
     spirv: [..]u8;
 };
 
@@ -64,11 +82,19 @@ slang_create_session :: () -> *slang.ISession {
         target.profile = slang.IGlobalSession_findProfile(slang_global_session, temp_c_string("spirv_1_3"));
     }
 
+    // Keep HLSL entry names in SPIR-V (cs_main, vs_main, …) — slangc -fvk-use-entrypoint-name.
+    vk_ep_name: slang.CompilerOptionEntry;
+    vk_ep_name.name = .VulkanUseEntryPointName;
+    vk_ep_name.value.kind = .Int;
+    vk_ep_name.value.intValue0 = 1;
+
     session_desc: slang.SessionDesc;
     session_desc.targets = *target;
     session_desc.targetCount = 1;
     // Match Math::Matrix4 (row-major). Equivalent to slangc -matrix-layout-row-major.
     session_desc.defaultMatrixLayoutMode = .ROW_MAJOR;
+    session_desc.compilerOptionEntries = *vk_ep_name;
+    session_desc.compilerOptionEntryCount = 1;
 
     session: *slang.ISession;
     assert(
@@ -177,23 +203,58 @@ reflect_loaded_module :: (
     collect_from_program_layout(reflection, blueprint);
 }
 
-// Hull/domain/geometry (and incomplete stubs) can crash slang's
-// spReflectionEntryPoint_getParameterByIndex — skip param walk for those.
-reflect_stage_supports_params :: (stage: slang.SlangStage) -> bool {
-    if stage == {
-        case .VERTEX; #through;
-        case .FRAGMENT; #through;
-        case .COMPUTE;
-            return true;
+collect_global_resources :: (reflection: *slang.SlangReflection, blueprint: *ShaderBlueprint) {
+    // Prefer the indexed parameter API when it is well-behaved (compute-only modules).
+    global_count := slang.spReflection_GetParameterCount(reflection);
+    if global_count > 0 && global_count <= 64 {
+        for gi: 0..global_count-1 {
+            gparam := slang.spReflection_GetParameterByIndex(reflection, gi);
+            assert(gparam != null, "GetParameterByIndex(%) returned null", gi);
+            collect_variable_layout(gparam, null, null, null, *blueprint.uniforms, *blueprint.resources, .COMPUTE);
+        }
+        if blueprint.resources.count return;
     }
-    return false;
+
+    global_var := slang.spReflection_getGlobalParamsVarLayout(reflection);
+    if !global_var return;
+
+    type_layout := slang.spReflectionVariableLayout_GetTypeLayout(global_var);
+    if !type_layout {
+        collect_variable_layout(global_var, null, null, null, *blueprint.uniforms, *blueprint.resources, .COMPUTE);
+        return;
+    }
+
+    field_count := slang.spReflectionTypeLayout_GetFieldCount(type_layout);
+    if field_count == 0 {
+        collect_variable_layout(global_var, null, null, null, *blueprint.uniforms, *blueprint.resources, .COMPUTE);
+        return;
+    }
+
+    for fi: 0..field_count-1 {
+        field := slang.spReflectionTypeLayout_GetFieldByIndex(type_layout, fi);
+        assert(field != null, "GetFieldByIndex(%) on global params returned null", fi);
+        collect_variable_layout(field, null, null, null, *blueprint.uniforms, *blueprint.resources, .COMPUTE);
+    }
 }
 
 collect_from_program_layout :: (reflection: *slang.SlangReflection, blueprint: *ShaderBlueprint) {
+    collect_global_resources(reflection, blueprint);
+
     ep_count := slang.spReflection_getEntryPointCount(reflection);
+
+    // libslang SEGV in getParameterByIndex once a linked program contains hull/domain/geometry.
+    // Detect that up front; still record every entry name/type for Spawn.
+    has_patch_stages := false;
+    for i: 0..ep_count-1 {
+        ep0 := slang.spReflection_getEntryPointByIndex(reflection, xx i);
+        if !ep0 continue;
+        st0 := cast(u32) slang.spReflectionEntryPoint_getStage(ep0);
+        if st0 == 2 || st0 == 3 || st0 == 4 then has_patch_stages = true;
+    }
+
     for i: 0..ep_count-1 {
         ep := slang.spReflection_getEntryPointByIndex(reflection, xx i);
-        if !ep continue;
+        assert(ep != null, "getEntryPointByIndex(%) returned null", i);
 
         name_c := slang.spReflectionEntryPoint_getName(ep);
         assert(name_c != null, "entry point % has no name", i);
@@ -213,18 +274,24 @@ collect_from_program_layout :: (reflection: *slang.SlangReflection, blueprint: *
         outputs: [..]SlangVaryingType;
         uniforms: [..]SlangUniformType;
 
-        if reflect_stage_supports_params(stage) {
+        if !has_patch_stages {
             param_count := slang.spReflectionEntryPoint_getParameterCount(ep);
+            assert(param_count <= 64,
+                "entry '%' reports implausible parameter count %", ep_info.name, param_count);
+
             for p: 0..param_count-1 {
                 param := slang.spReflectionEntryPoint_getParameterByIndex(ep, p);
-                if !param continue;
-                collect_variable_layout(param, *inputs, *outputs, *uniforms, *blueprint.uniforms, stage);
+                assert(param != null, "getParameterByIndex(ep '%', param %) returned null", ep_info.name, p);
+                collect_variable_layout(param, *inputs, *outputs, *uniforms, *blueprint.uniforms, *blueprint.resources, stage);
             }
 
             result_layout := slang.spReflectionEntryPoint_getResultVarLayout(ep);
             if result_layout {
-                collect_variable_layout(result_layout, *inputs, *outputs, *uniforms, *blueprint.uniforms, stage);
+                collect_variable_layout(result_layout, *inputs, *outputs, *uniforms, *blueprint.uniforms, *blueprint.resources, stage);
             }
+        } else if stage == .VERTEX {
+            // Tessellation programs: invent the VS input the shader declares (POSITION float3).
+            array_add(*inputs, .{ name = copy_string("position"), type = type_info(Vector3) });
         }
 
         ep_info.inputs = inputs;
@@ -240,6 +307,7 @@ collect_variable_layout :: (
     outputs: *[..]SlangVaryingType,
     entry_uniforms: *[..]SlangUniformType,
     blueprint_uniforms: *[..]SlangUniformType,
+    blueprint_resources: *[..]SlangResourceBinding,
     entry_stage: slang.SlangStage,
 ) {
     variable := slang.spReflectionVariableLayout_GetVariable(var_layout);
@@ -255,11 +323,13 @@ collect_variable_layout :: (
     category := slang.spReflectionTypeLayout_GetParameterCategory(type_layout);
 
     if category == .VARYING_INPUT || category == .VERTEX_INPUT {
+        assert(inputs != null, "varying input '%' outside entry-point context", name);
         append_reflected_varyings(type, name, inputs);
         return;
     }
 
     if category == .VARYING_OUTPUT || category == .FRAGMENT_OUTPUT {
+        assert(outputs != null, "varying output '%' outside entry-point context", name);
         append_reflected_varyings(type, name, outputs);
         return;
     }
@@ -268,7 +338,6 @@ collect_variable_layout :: (
         leaf := unwrap_container_type(type);
         offset := cast(u32) slang.spReflectionVariableLayout_GetOffset(var_layout, category);
 
-        // Descriptor binding if ConstantBuffer; entry-point `uniform T` → push constant.
         set: u32 = VULKAN_UNIFORM_PUSH_CONSTANT;
         binding: u32 = VULKAN_UNIFORM_PUSH_CONSTANT;
         if category == .CONSTANT_BUFFER {
@@ -288,8 +357,81 @@ collect_variable_layout :: (
         for blueprint_uniforms.* {
             if it.name == name return;
         }
-        array_add(entry_uniforms, uniform);
+        if entry_uniforms then array_add(entry_uniforms, uniform);
         array_add(blueprint_uniforms, uniform);
+        return;
+    }
+
+    type_kind := slang.spReflectionType_GetKind(type);
+
+    is_resource := category == .UNORDERED_ACCESS
+        || category == .SHADER_RESOURCE
+        || category == .SAMPLER_STATE
+        || category == .DESCRIPTOR_TABLE_SLOT
+        || type_kind == .SHADER_STORAGE_BUFFER
+        || type_kind == .RESOURCE
+        || type_kind == .SAMPLER_STATE
+        || type_kind == .TEXTURE_BUFFER;
+
+    if category == .MIXED {
+        cat_count := slang.spReflectionTypeLayout_GetCategoryCount(type_layout);
+        for ci: 0..cat_count-1 {
+            sub := slang.spReflectionTypeLayout_GetCategoryByIndex(type_layout, ci);
+            if sub == .UNORDERED_ACCESS || sub == .SHADER_RESOURCE || sub == .DESCRIPTOR_TABLE_SLOT || sub == .SAMPLER_STATE {
+                is_resource = true;
+                break;
+            }
+        }
+    }
+
+    if is_resource {
+        set := cast(u32) slang.spReflectionVariableLayout_GetSpace(var_layout, .DESCRIPTOR_TABLE_SLOT);
+        binding := cast(u32) slang.spReflectionVariableLayout_GetOffset(var_layout, .DESCRIPTOR_TABLE_SLOT);
+
+        has_uav := category == .UNORDERED_ACCESS;
+        has_srv := category == .SHADER_RESOURCE;
+        has_samp := category == .SAMPLER_STATE;
+        cat_count := slang.spReflectionTypeLayout_GetCategoryCount(type_layout);
+        for ci: 0..cat_count-1 {
+            sub := slang.spReflectionTypeLayout_GetCategoryByIndex(type_layout, ci);
+            if sub == .UNORDERED_ACCESS then has_uav = true;
+            if sub == .SHADER_RESOURCE then has_srv = true;
+            if sub == .SAMPLER_STATE then has_samp = true;
+        }
+
+        shape := slang.spReflectionType_GetResourceShape(type);
+        access := slang.spReflectionType_GetResourceAccess(type);
+        base_shape := cast(u32) (cast(u32) shape & 15); // RESOURCE_BASE_SHAPE_MASK
+
+        kind := SlangResourceKind.STORAGE_BUFFER;
+        if has_samp || type_kind == .SAMPLER_STATE {
+            kind = .SAMPLER;
+        } else if base_shape == 6 || base_shape == 7 || type_kind == .SHADER_STORAGE_BUFFER {
+            // STRUCTURED_BUFFER / BYTE_ADDRESS_BUFFER
+            kind = .STORAGE_BUFFER;
+        } else if base_shape >= 1 && base_shape <= 5 {
+            // Texture shapes
+            if access == .READ_WRITE || access == .WRITE || has_uav {
+                kind = .STORAGE_TEXTURE;
+            } else {
+                kind = .SAMPLED_TEXTURE;
+            }
+        } else if has_uav {
+            kind = .STORAGE_BUFFER;
+        } else if has_srv || type_kind == .RESOURCE {
+            kind = .SAMPLED_TEXTURE;
+        }
+
+        for blueprint_resources.* {
+            if it.name == name return;
+        }
+        array_add(blueprint_resources, .{
+            name = name,
+            set = set,
+            binding = binding,
+            kind = kind,
+        });
+        return;
     }
 }
 
@@ -406,18 +548,27 @@ slang_stage_to_shader_type :: (stage: slang.SlangStage) -> SlangShaderType {
     case .VERTEX;   return .VERTEX_SHADER;
     case .FRAGMENT; return .FRAGMENT_SHADER;
     case .COMPUTE;  return .COMPUTE_SHADER;
-    // Hull/domain/geometry mapped as fragment only for bookkeeping; params are skipped.
-    case;           return .FRAGMENT_SHADER;
+    case .HULL;     return .HULL_SHADER;
+    case .DOMAIN;   return .DOMAIN_SHADER;
+    case .GEOMETRY; return .GEOMETRY_SHADER;
+    case;
+        assert(false, "unsupported slang stage %", cast(u32) stage);
+        return .FRAGMENT_SHADER;
     }
 }
 
 slang_stage_to_vk_flags :: (stage: slang.SlangStage) -> u32 {
     // VK_SHADER_STAGE_* bit values (avoid depending on Vulkan module during wasm builds).
     if stage == {
-    case .VERTEX;   return 0x00000001;
+    case .VERTEX;   return 0x00000001; // VK_SHADER_STAGE_VERTEX_BIT
+    case .HULL;     return 0x00000002; // TESSELLATION_CONTROL
+    case .DOMAIN;   return 0x00000004; // TESSELLATION_EVALUATION
+    case .GEOMETRY; return 0x00000008;
     case .FRAGMENT; return 0x00000010;
     case .COMPUTE;  return 0x00000020;
-    case;           return 0x00000001;
+    case;
+        assert(false, "unsupported slang stage % for vk flags", cast(u32) stage);
+        return 0;
     }
 }
 
