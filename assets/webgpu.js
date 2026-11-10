@@ -100,16 +100,20 @@ function bind_canvas_input(canvas) {
     const [x, y] = local_xy(e);
     if (e.pointerType === "touch") {
       pending_events.push({ kind: 3, type: 0, i0: e.pointerId | 0, i1: x, i2: y, f: e.pressure || 1 });
+      // Also feed as mouse so ImGuiBackend (mouse-only today) can drag on touch.
+      pending_events.push({ kind: 1, type: 1, i0: 0, i1: x, i2: y, f: 0 });
     } else {
-      pending_events.push({ kind: 1, type: 0, i0: e.button | 0, i1: 0, i2: 0, f: 0 });
+      // js_canvas: subtype down → MouseEvent(btn, PRESS, i1=x, i2=y)
+      pending_events.push({ kind: 1, type: 1, i0: e.button | 0, i1: x, i2: y, f: 0 });
     }
   });
   canvas.addEventListener("pointerup", (e) => {
     const [x, y] = local_xy(e);
     if (e.pointerType === "touch") {
       pending_events.push({ kind: 3, type: 1, i0: e.pointerId | 0, i1: x, i2: y, f: 0 });
+      pending_events.push({ kind: 1, type: 0, i0: 0, i1: x, i2: y, f: 0 });
     } else {
-      pending_events.push({ kind: 1, type: 1, i0: e.button | 0, i1: 0, i2: 0, f: 0 });
+      pending_events.push({ kind: 1, type: 0, i0: e.button | 0, i1: x, i2: y, f: 0 });
     }
   });
   canvas.addEventListener("pointercancel", (e) => {
@@ -121,6 +125,7 @@ function bind_canvas_input(canvas) {
     const [x, y] = local_xy(e);
     if (e.pointerType === "touch") {
       pending_events.push({ kind: 3, type: 2, i0: e.pointerId | 0, i1: x, i2: y, f: e.pressure || 1 });
+      pending_events.push({ kind: 1, type: 2, i0: x, i1: y, i2: 0, f: 0 });
     } else {
       pending_events.push({ kind: 1, type: 2, i0: x, i1: y, i2: 0, f: 0 });
     }
@@ -134,15 +139,22 @@ function bind_canvas_input(canvas) {
     });
   }, { passive: true });
 
+  // KEYBOARD subtype: 0=up/release, 1=down/press, 2=repeat (matches js_canvas.jai)
   canvas.addEventListener("keydown", (e) => {
-    const type = e.repeat ? 3 : 0;
+    const type = e.repeat ? 2 : 1;
     pending_events.push({ kind: 2, type, i0: e.keyCode | 0, i1: 0, i2: 0, f: 0 });
     if (e.key && e.key.length === 1) {
-      pending_events.push({ kind: 2, type: 2, i0: e.key.codePointAt(0) | 0, i1: 0, i2: 0, f: 0 });
+      // Also emit uppercase ASCII so WASD matches host X11 mapping.
+      const ch = e.key.toUpperCase().codePointAt(0) | 0;
+      pending_events.push({ kind: 2, type, i0: ch, i1: 0, i2: 0, f: 0 });
     }
   });
   canvas.addEventListener("keyup", (e) => {
-    pending_events.push({ kind: 2, type: 1, i0: e.keyCode | 0, i1: 0, i2: 0, f: 0 });
+    pending_events.push({ kind: 2, type: 0, i0: e.keyCode | 0, i1: 0, i2: 0, f: 0 });
+    if (e.key && e.key.length === 1) {
+      const ch = e.key.toUpperCase().codePointAt(0) | 0;
+      pending_events.push({ kind: 2, type: 0, i0: ch, i1: 0, i2: 0, f: 0 });
+    }
   });
 }
 
@@ -374,10 +386,70 @@ const webgpu_imports = {
     }));
   },
 
+  jsCreateBindGroupLayoutStorageTexture: () => {
+    // Match slangc WGSL: texture_storage_2d<rgba8unorm, read_write>
+    return add_object(gpu_device.createBindGroupLayout({
+      entries: [{
+        binding: 0,
+        visibility: GPUShaderStage.COMPUTE,
+        storageTexture: { access: "read-write", format: "rgba8unorm", viewDimension: "2d" },
+      }],
+    }));
+  },
+
+  jsCreateBindGroupLayoutStorageTextureUniform: () => {
+    // Output @binding(0) + entry-point uniforms UBO @binding(1)
+    return add_object(gpu_device.createBindGroupLayout({
+      entries: [
+        {
+          binding: 0,
+          visibility: GPUShaderStage.COMPUTE,
+          storageTexture: { access: "read-write", format: "rgba8unorm", viewDimension: "2d" },
+        },
+        {
+          binding: 1,
+          visibility: GPUShaderStage.COMPUTE,
+          buffer: { type: "uniform" },
+        },
+      ],
+    }));
+  },
+
+  jsCreateComputePipeline: (mod_handle, entry_ptr, entry_len, layout_handle) => {
+    const entry = read_str(entry_ptr, entry_len);
+    const layout = gpu_device.createPipelineLayout({
+      bindGroupLayouts: [get_object(layout_handle)],
+    });
+    return add_object(gpu_device.createComputePipeline({
+      layout,
+      compute: { module: get_object(mod_handle), entryPoint: entry },
+    }));
+  },
+
   jsCreateBindGroupUniform: (layout_handle, buffer_handle) => {
     return add_object(gpu_device.createBindGroup({
       layout: get_object(layout_handle),
       entries: [{ binding: 0, resource: { buffer: get_object(buffer_handle) } }],
+    }));
+  },
+
+  jsCreateBindGroupStorageTexture: (layout_handle, tex_handle) => {
+    return add_object(gpu_device.createBindGroup({
+      layout: get_object(layout_handle),
+      entries: [{
+        binding: 0,
+        resource: get_object(tex_handle).createView(),
+      }],
+    }));
+  },
+
+  jsCreateBindGroupStorageTextureUniform: (layout_handle, tex_handle, uniform_handle) => {
+    return add_object(gpu_device.createBindGroup({
+      layout: get_object(layout_handle),
+      entries: [
+        { binding: 0, resource: get_object(tex_handle).createView() },
+        { binding: 1, resource: { buffer: get_object(uniform_handle) } },
+      ],
     }));
   },
 
@@ -600,6 +672,19 @@ const webgpu_imports = {
   jsEndRenderPass: () => {
     webgpu_imports._pass.end();
     webgpu_imports._pass = null;
+  },
+
+  jsBeginComputePass: () => {
+    webgpu_imports._pass = webgpu_imports._encoder.beginComputePass();
+  },
+
+  jsEndComputePass: () => {
+    webgpu_imports._pass.end();
+    webgpu_imports._pass = null;
+  },
+
+  jsDispatch: (groups_x, groups_y, groups_z) => {
+    webgpu_imports._pass.dispatchWorkgroups(Number(groups_x), Number(groups_y), Number(groups_z));
   },
 
   jsSubmit: () => {

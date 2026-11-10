@@ -195,11 +195,26 @@ Texture :: (
     assert(mips == 1, "Texture2D: mips > 1 not supported on WebGPU path yet");
 
     is_depth := (usage & .DEPTH_STENCIL) != 0 || format == .D32_SFLOAT || format == .D24_UNORM_S8_UINT;
-    // TEXTURE_BINDING=0x04, RENDER_ATTACHMENT=0x10, COPY_SRC=0x01, COPY_DST=0x02
-    gpu_usage: u32 = 0x10; // RENDER_ATTACHMENT
-    if !is_depth {
-        gpu_usage |= 0x04 | 0x01; // SAMPLED + COPY_SRC for Present/Get
+    // TEXTURE_BINDING=0x04, STORAGE_BINDING=0x08, RENDER_ATTACHMENT=0x10, COPY_SRC=0x01, COPY_DST=0x02
+    gpu_usage: u32 = 0;
+    if is_depth {
+        gpu_usage = 0x10; // RENDER_ATTACHMENT
+    } else {
+        if (usage & .STORAGE) != 0 {
+            gpu_usage |= 0x08; // STORAGE_BINDING
+        }
+        if (usage & .COLOR_ATTACHMENT) != 0 {
+            gpu_usage |= 0x10; // RENDER_ATTACHMENT
+        }
+        if (usage & .SAMPLED) != 0 || (usage & .STORAGE) != 0 {
+            gpu_usage |= 0x04; // TEXTURE_BINDING (Present samples compute targets)
+        }
+        if (usage & .COPY_SRC) != 0 then gpu_usage |= 0x01;
         if (usage & .COPY_DST) != 0 || locality == .CREATE_ON_HOST then gpu_usage |= 0x02;
+        // Default color target when no explicit bits requested.
+        if gpu_usage == 0 {
+            gpu_usage = 0x10 | 0x04 | 0x01;
+        }
     }
 
     tex: WebGpuTexture2D;
@@ -438,6 +453,8 @@ END;
     print_to_builder(*builder, "};\n");
     print_to_builder(*builder, "vs_entry :: \"vs_main\";\n");
     print_to_builder(*builder, "fs_entry :: \"fs_main\";\n");
+    print_to_builder(*builder, "cs_entry :: \"\";\n");
+    print_to_builder(*builder, "is_compute :: false;\n");
     print_to_builder(*builder, "push_constant_bytes :: 64;\n\n");
     print_to_builder(*builder, "spirv_raw :: u8.[\n");
     for i: 0..data.count-1 {
@@ -461,6 +478,12 @@ struct Vertex_t {
     float3 Normal;
 };
 
+struct Frame {
+    float4x4 MVP;
+    float3 LightDir;
+    float Ambient;
+};
+
 struct VSOutput {
     float4 Pos : SV_Position;
     float3 Color : COLOR;
@@ -468,18 +491,18 @@ struct VSOutput {
 };
 
 [shader("vertex")]
-VSOutput vs_main(Vertex_t v, uniform float4x4 MVP) {
+VSOutput vs_main(Vertex_t v, uniform Frame frame) {
     VSOutput o;
-    o.Pos = mul(MVP, float4(v.Pos, 1.0));
+    o.Pos = mul(frame.MVP, float4(v.Pos, 1.0));
     o.Color = v.Color;
     o.Nrm = v.Normal;
     return o;
 }
 
 [shader("fragment")]
-float4 fs_main(VSOutput input, uniform float3 LightDir, uniform float Ambient) : SV_Target {
-    float ndotl = saturate(dot(normalize(input.Nrm), normalize(-LightDir)));
-    float3 lit = input.Color * (Ambient + (1.0 - Ambient) * ndotl);
+float4 fs_main(VSOutput input, uniform Frame frame) : SV_Target {
+    float ndotl = saturate(dot(normalize(input.Nrm), normalize(-frame.LightDir)));
+    float3 lit = input.Color * (frame.Ambient + (1.0 - frame.Ambient) * ndotl);
     return float4(lit, 1.0);
 }
 END;
@@ -516,12 +539,165 @@ END;
     print_to_builder(*builder, "    set = 0, binding = 0, stage_flags = 2,\n");
     print_to_builder(*builder, "};\n");
     print_to_builder(*builder, "Ambient :: UniformDefinition.{\n");
-    print_to_builder(*builder, "    name = \"Ambient\", type = type_of(float), offset = 80,\n");
+    print_to_builder(*builder, "    name = \"Ambient\", type = type_of(float), offset = 76,\n");
     print_to_builder(*builder, "    set = 0, binding = 0, stage_flags = 2,\n");
     print_to_builder(*builder, "};\n");
     print_to_builder(*builder, "vs_entry :: \"vs_main\";\n");
     print_to_builder(*builder, "fs_entry :: \"fs_main\";\n");
-    print_to_builder(*builder, "push_constant_bytes :: 96;\n\n");
+    print_to_builder(*builder, "cs_entry :: \"\";\n");
+    print_to_builder(*builder, "is_compute :: false;\n");
+    print_to_builder(*builder, "push_constant_bytes :: 80;\n\n");
+    print_to_builder(*builder, "spirv_raw :: u8.[\n");
+    for i: 0..data.count-1 {
+        print_to_builder(*builder, "%,", data[i]);
+        if (i + 1) % 16 == 0 then print_to_builder(*builder, "\n");
+    }
+    print_to_builder(*builder, "\n];\n");
+    return builder_to_string(*builder);
+}
+
+WEBGPU_CORNELL_COMPUTE_MEMBERS :: #run,host -> string {
+    File :: #import "File";
+    Process :: #import "Process";
+    #import "Basic";
+    #import "String";
+
+    slang := #string END
+// CORNELL_COMPUTE
+[[format("rgba8")]]
+RWTexture2D<float4> Output;
+
+bool hit_aabb(float3 ro, float3 rd, float3 bmin, float3 bmax, out float tHit, out float3 nrm) {
+    float3 inv = 1.0 / rd;
+    float3 t0 = (bmin - ro) * inv;
+    float3 t1 = (bmax - ro) * inv;
+    float3 tminv = min(t0, t1);
+    float3 tmaxv = max(t0, t1);
+    float tmin = max(max(tminv.x, tminv.y), tminv.z);
+    float tmax = min(min(tmaxv.x, tmaxv.y), tmaxv.z);
+    if (tmax < max(tmin, 0.0)) {
+        tHit = 0.0;
+        nrm = float3(0, 1, 0);
+        return false;
+    }
+    tHit = tmin > 0.0 ? tmin : tmax;
+    if (tHit <= 0.0) {
+        nrm = float3(0, 1, 0);
+        return false;
+    }
+    float3 p = ro + rd * tHit;
+    float3 c = (bmin + bmax) * 0.5;
+    float3 d = (p - c) / max(bmax - bmin, float3(1e-4, 1e-4, 1e-4));
+    float3 a = abs(d);
+    if (a.x > a.y && a.x > a.z) nrm = float3(sign(d.x), 0, 0);
+    else if (a.y > a.z) nrm = float3(0, sign(d.y), 0);
+    else nrm = float3(0, 0, sign(d.z));
+    return true;
+}
+
+[shader("compute")]
+[numthreads(8, 8, 1)]
+void cs_main(
+    uint3 id : SV_DispatchThreadID,
+    uniform float3 CameraPos,
+    uniform float3 CameraFwd
+) {
+    const uint W = 800;
+    const uint H = 600;
+    if (id.x >= W || id.y >= H) return;
+
+    float2 uv = (float2(id.xy) + 0.5) / float2(W, H);
+    uv = uv * 2.0 - 1.0;
+    uv.y = -uv.y;
+    float aspect = float(W) / float(H);
+
+    float3 ro = CameraPos;
+    float3 forward = normalize(CameraFwd);
+    float3 worldUp = float3(0.0, 1.0, 0.0);
+    float3 right = normalize(cross(forward, worldUp));
+    if (dot(right, right) < 1e-6) {
+        right = normalize(cross(forward, float3(0.0, 0.0, 1.0)));
+    }
+    float3 up = cross(right, forward);
+    float3 rd = normalize(forward + right * (uv.x * aspect * 0.7) + up * (uv.y * 0.7));
+
+    float3 lightPos = float3(0.0, 0.92, 0.0);
+    float bestT = 1e9;
+    float3 albedo = float3(0.02, 0.02, 0.03);
+    float3 nrm = float3(0, 1, 0);
+    float emissive = 0.0;
+
+    float t; float3 n;
+    if (hit_aabb(ro, rd, float3(-1,-1.02,-1), float3(1,-0.98,1), t, n) && t < bestT) {
+        bestT = t; albedo = float3(0.75,0.75,0.75); nrm = n; emissive = 0;
+    }
+    if (hit_aabb(ro, rd, float3(-1,0.98,-1), float3(1,1.02,1), t, n) && t < bestT) {
+        bestT = t; albedo = float3(0.75,0.75,0.75); nrm = n; emissive = 0;
+    }
+    if (hit_aabb(ro, rd, float3(-1,-1,-1.02), float3(1,1,-0.98), t, n) && t < bestT) {
+        bestT = t; albedo = float3(0.75,0.75,0.75); nrm = n; emissive = 0;
+    }
+    if (hit_aabb(ro, rd, float3(-1.02,-1,-1), float3(-0.98,1,1), t, n) && t < bestT) {
+        bestT = t; albedo = float3(0.75,0.12,0.12); nrm = n; emissive = 0;
+    }
+    if (hit_aabb(ro, rd, float3(0.98,-1,-1), float3(1.02,1,1), t, n) && t < bestT) {
+        bestT = t; albedo = float3(0.12,0.55,0.12); nrm = n; emissive = 0;
+    }
+    if (hit_aabb(ro, rd, float3(-0.65,-1.0,-0.55), float3(-0.20,0.15,-0.05), t, n) && t < bestT) {
+        bestT = t; albedo = float3(0.85,0.85,0.7); nrm = n; emissive = 0;
+    }
+    if (hit_aabb(ro, rd, float3(0.10,-1.0,-0.10), float3(0.55,-0.35,0.40), t, n) && t < bestT) {
+        bestT = t; albedo = float3(0.7,0.85,0.85); nrm = n; emissive = 0;
+    }
+    if (hit_aabb(ro, rd, float3(-0.35,0.97,-0.25), float3(0.35,0.999,0.25), t, n) && t < bestT) {
+        bestT = t; albedo = float3(1,1,0.9); nrm = n; emissive = 8.0;
+    }
+
+    float3 col = albedo * emissive;
+    if (emissive < 0.01 && bestT < 1e8) {
+        float3 p = ro + rd * bestT;
+        float3 l = normalize(lightPos - p);
+        float ndotl = saturate(dot(normalize(nrm), l));
+        float dist = length(lightPos - p);
+        float atten = 1.0 / (0.4 + dist * dist);
+        col = albedo * (0.08 + 2.5 * ndotl * atten);
+    }
+    Output[id.xy] = float4(col, 1.0);
+}
+END;
+    File.make_directory_if_it_does_not_exist(".bin/.build", recursive = true);
+    assert(File.write_entire_file(".bin/.build/webgpu_cornell_cs.slang", slang), "write cornell cs slang");
+    result, stdout, stderr := Process.run_command(
+        "env", "-u", "LD_LIBRARY_PATH",
+        "slangc", ".bin/.build/webgpu_cornell_cs.slang",
+        "-target", "wgsl",
+        "-matrix-layout-row-major",
+        "-entry", "cs_main", "-stage", "compute",
+        "-o", ".bin/.build/webgpu_cornell_cs.wgsl",
+        capture_and_return_output = true,
+    );
+    assert(result.type != .FAILED_TO_LAUNCH, "slangc not found on PATH");
+    assert(result.exit_code == 0, "slangc→wgsl cornell compute failed:\n%\n%", stdout, stderr);
+    data, ok := File.read_entire_file(".bin/.build/webgpu_cornell_cs.wgsl");
+    assert(ok && data.count > 0, "read cornell cs wgsl failed");
+
+    builder: String_Builder;
+    print_to_builder(*builder, "Vertex_t :: struct {\n");
+    print_to_builder(*builder, "    GPU_USAGE :: BUFFER_USAGE.VERTEX;\n");
+    print_to_builder(*builder, "};\n\n");
+    print_to_builder(*builder, "CameraPos :: UniformDefinition.{\n");
+    print_to_builder(*builder, "    name = \"CameraPos\", type = type_of(Vector3), offset = 0,\n");
+    print_to_builder(*builder, "    set = 0, binding = 1, stage_flags = 32,\n");
+    print_to_builder(*builder, "};\n");
+    print_to_builder(*builder, "CameraFwd :: UniformDefinition.{\n");
+    print_to_builder(*builder, "    name = \"CameraFwd\", type = type_of(Vector3), offset = 16,\n");
+    print_to_builder(*builder, "    set = 0, binding = 1, stage_flags = 32,\n");
+    print_to_builder(*builder, "};\n");
+    print_to_builder(*builder, "vs_entry :: \"\";\n");
+    print_to_builder(*builder, "fs_entry :: \"\";\n");
+    print_to_builder(*builder, "cs_entry :: \"cs_main\";\n");
+    print_to_builder(*builder, "is_compute :: true;\n");
+    print_to_builder(*builder, "push_constant_bytes :: 32;\n\n");
     print_to_builder(*builder, "spirv_raw :: u8.[\n");
     for i: 0..data.count-1 {
         print_to_builder(*builder, "%,", data[i]);
@@ -538,8 +714,12 @@ WebGpuShader :: struct ($source: string, $stages: [] string) {
     uniform_layout: WGpuHandle;
     uniform_buffer: WGpuHandle;
     bind_group: WGpuHandle;
+    storage_layout: WGpuHandle;
     #insert -> string {
         _ := stages;
+        if contains(source, "CORNELL_COMPUTE") {
+            return WEBGPU_CORNELL_COMPUTE_MEMBERS;
+        }
         if contains(source, "LightDir") || contains(source, "Ambient") {
             return WEBGPU_LIT_MEMBERS;
         }
@@ -560,18 +740,33 @@ Spawn :: (dev: *WebGpuDevice, $source: string, $stages: [] string) -> WebGpuShad
     assert(Shader_t.spirv_raw.count > 0, "Spawn: empty WGSL");
 
     shdr.module_handle = jsCreateShaderModule(Shader_t.spirv_raw.data, xx Shader_t.spirv_raw.count);
-    shdr.uniform_layout = jsCreateBindGroupLayoutUniform();
-    shdr.uniform_buffer = jsCreateUniformBuffer(Shader_t.push_constant_bytes);
-    shdr.bind_group = jsCreateBindGroupUniform(shdr.uniform_layout, shdr.uniform_buffer);
 
-    stride := cast(u32) size_of(Shader_t.Vertex_t);
-    shdr.pipeline = jsCreateRenderPipeline(
-        shdr.module_handle, Shader_t.vs_entry.data, xx Shader_t.vs_entry.count,
-        shdr.module_handle, Shader_t.fs_entry.data, xx Shader_t.fs_entry.count,
-        stride, 1,
-        0, 1,
-        shdr.uniform_layout,
-    );
+    #if Shader_t.is_compute {
+        if Shader_t.push_constant_bytes > 0 {
+            shdr.storage_layout = jsCreateBindGroupLayoutStorageTextureUniform();
+            shdr.uniform_buffer = jsCreateUniformBuffer(Shader_t.push_constant_bytes);
+        } else {
+            shdr.storage_layout = jsCreateBindGroupLayoutStorageTexture();
+        }
+        shdr.pipeline = jsCreateComputePipeline(
+            shdr.module_handle,
+            Shader_t.cs_entry.data, xx Shader_t.cs_entry.count,
+            shdr.storage_layout,
+        );
+    } else {
+        shdr.uniform_layout = jsCreateBindGroupLayoutUniform();
+        shdr.uniform_buffer = jsCreateUniformBuffer(Shader_t.push_constant_bytes);
+        shdr.bind_group = jsCreateBindGroupUniform(shdr.uniform_layout, shdr.uniform_buffer);
+
+        stride := cast(u32) size_of(Shader_t.Vertex_t);
+        shdr.pipeline = jsCreateRenderPipeline(
+            shdr.module_handle, Shader_t.vs_entry.data, xx Shader_t.vs_entry.count,
+            shdr.module_handle, Shader_t.fs_entry.data, xx Shader_t.fs_entry.count,
+            stride, 1,
+            0, 1,
+            shdr.uniform_layout,
+        );
+    }
     return shdr;
 }
 
@@ -579,6 +774,7 @@ Destroy :: (shdr: *WebGpuShader($source, $stages)) {
     if shdr.bind_group { jsDestroyHandle(shdr.bind_group); }
     if shdr.uniform_buffer { jsDestroyHandle(shdr.uniform_buffer); }
     if shdr.uniform_layout { jsDestroyHandle(shdr.uniform_layout); }
+    if shdr.storage_layout { jsDestroyHandle(shdr.storage_layout); }
     if shdr.pipeline { jsDestroyHandle(shdr.pipeline); }
     if shdr.module_handle { jsDestroyHandle(shdr.module_handle); }
 }
@@ -599,6 +795,11 @@ WebGpuGraphicsQueue :: struct {
 
 WebGpuComputeQueue :: struct {
     device: *WebGpuDevice;
+    recording: bool;
+    storage_bound: bool;
+    bound_pipeline: WGpuHandle;
+    bound_bind_group: WGpuHandle;
+    storage_layout: WGpuHandle;
 }
 
 WebGpuCopyQueue :: struct {
@@ -607,6 +808,11 @@ WebGpuCopyQueue :: struct {
 
 WebGpuGraphicsPass :: struct($source: string, $stages: [] string) {
     queue: *WebGpuGraphicsQueue;
+    shader: *WebGpuShader(source, stages);
+}
+
+WebGpuComputePass :: struct($source: string, $stages: [] string) {
+    queue: *WebGpuComputeQueue;
     shader: *WebGpuShader(source, stages);
 }
 
@@ -620,9 +826,15 @@ Queue :: (dev: *WebGpuDevice, $type: QUEUE_TYPE) -> WebGpuGraphicsQueue
 Queue :: (dev: *WebGpuDevice, $type: QUEUE_TYPE) -> WebGpuComputeQueue
     #modify { return type == .COMPUTE; }
 {
-    _ := dev;
-    not_implemented("Queue(COMPUTE) WebGPU");
-    return .{};
+    assert(dev != null, "Queue(COMPUTE): invalid device");
+    return .{
+        device = dev,
+        recording = false,
+        storage_bound = false,
+        bound_pipeline = 0,
+        bound_bind_group = 0,
+        storage_layout = 0,
+    };
 }
 
 Queue :: (dev: *WebGpuDevice, $type: QUEUE_TYPE) -> WebGpuCopyQueue
@@ -664,8 +876,29 @@ Pass :: (q: *WebGpuGraphicsQueue, shdr: *WebGpuShader($source, $stages)) -> [1] 
     return .[.{queue = q, shader = shdr}];
 }
 
+Pass :: (q: *WebGpuComputeQueue, shdr: *WebGpuShader($source, $stages)) -> [1] WebGpuComputePass(source, stages) {
+    assert(q && shdr, "Pass(Compute): invalid");
+    assert(shdr.pipeline != 0, "Pass(Compute): no pipeline");
+    assert(shdr.storage_layout != 0, "Pass(Compute): no storage layout");
+    if !q.recording {
+        jsBeginCommands();
+        q.recording = true;
+    }
+    jsBeginComputePass();
+    jsSetPipeline(shdr.pipeline);
+    q.bound_pipeline = shdr.pipeline;
+    q.storage_layout = shdr.storage_layout;
+    q.storage_bound = false;
+    if q.bound_bind_group {
+        jsDestroyHandle(q.bound_bind_group);
+        q.bound_bind_group = 0;
+    }
+    return .[.{queue = q, shader = shdr}];
+}
+
 Set :: (buf: *WebGpuBuffer) #expand { Set(`it, buf); }
 Set :: (buf: *WebGpuIndexBuffer($IndexT)) #expand { Set(`it, buf); }
+Set :: (tex: *WebGpuTexture2D) #expand { Set(`it, tex); }
 
 Set :: (pass: WebGpuGraphicsPass($source, $stages), buf: *WebGpuBuffer) {
     q := pass.queue;
@@ -694,6 +927,37 @@ Set :: (pass: WebGpuGraphicsPass($source, $stages), def: UniformDefinition, val:
     jsSetBindGroup(0, shdr.bind_group);
 }
 
+Set :: (pass: WebGpuComputePass($source, $stages), tex: *WebGpuTexture2D) {
+    assert(tex && tex.handle, "Set(compute texture): invalid");
+    assert((tex.usage & .STORAGE) != 0, "Set(compute): texture needs STORAGE usage");
+    q := pass.queue;
+    shdr := pass.shader;
+    if q.bound_bind_group {
+        jsDestroyHandle(q.bound_bind_group);
+        q.bound_bind_group = 0;
+    }
+    if shdr.uniform_buffer {
+        q.bound_bind_group = jsCreateBindGroupStorageTextureUniform(
+            q.storage_layout, tex.handle, shdr.uniform_buffer,
+        );
+    } else {
+        q.bound_bind_group = jsCreateBindGroupStorageTexture(q.storage_layout, tex.handle);
+    }
+    jsSetBindGroup(0, q.bound_bind_group);
+    q.storage_bound = true;
+}
+
+Set :: (pass: WebGpuComputePass($source, $stages), def: UniformDefinition, val: $T) {
+    shdr := pass.shader;
+    assert(shdr.uniform_buffer != 0, "Set(compute uniform): no uniform buffer on shader");
+    jsWriteBuffer(shdr.uniform_buffer, def.offset, cast(*u8) *val, xx size_of(T));
+}
+
+Set :: (pass: WebGpuComputePass($source, $stages), buf: *WebGpuBuffer) {
+    _ := pass; _ := buf;
+    not_implemented("WebGPU Set(compute STORAGE buffer)");
+}
+
 Record :: () #expand { Record(`it); }
 
 Record :: (pass: WebGpuGraphicsPass($source, $stages)) {
@@ -708,6 +972,21 @@ Submit :: (q: *WebGpuGraphicsQueue, wait := true) {
         jsEndRenderPass();
         jsSubmit();
         q.recording = false;
+    }
+}
+
+Submit :: (q: *WebGpuComputeQueue, groups_x: u32, groups_y: u32 = 1, groups_z: u32 = 1, wait := true) {
+    _ := wait;
+    assert(q.recording, "Submit(Compute): Pass first");
+    assert(q.storage_bound, "Submit(Compute): Set a STORAGE texture first");
+    assert(groups_x >= 1 && groups_y >= 1 && groups_z >= 1, "Submit(Compute): groups >= 1");
+    jsDispatch(groups_x, groups_y, groups_z);
+    jsEndComputePass();
+    jsSubmit();
+    q.recording = false;
+    if q.bound_bind_group {
+        jsDestroyHandle(q.bound_bind_group);
+        q.bound_bind_group = 0;
     }
 }
 
@@ -853,8 +1132,15 @@ jsCreatePresentPipeline :: (
 ) -> WGpuHandle #foreign;
 jsCreateBindGroupLayoutUniform :: () -> WGpuHandle #foreign;
 jsCreateBindGroupLayoutSampled :: () -> WGpuHandle #foreign;
+jsCreateBindGroupLayoutStorageTexture :: () -> WGpuHandle #foreign;
+jsCreateBindGroupLayoutStorageTextureUniform :: () -> WGpuHandle #foreign;
 jsCreateBindGroupUniform :: (layout: WGpuHandle, buffer: WGpuHandle) -> WGpuHandle #foreign;
 jsCreateBindGroupSampled :: (layout: WGpuHandle, sampler: WGpuHandle, tex: WGpuHandle) -> WGpuHandle #foreign;
+jsCreateBindGroupStorageTexture :: (layout: WGpuHandle, tex: WGpuHandle) -> WGpuHandle #foreign;
+jsCreateBindGroupStorageTextureUniform :: (layout: WGpuHandle, tex: WGpuHandle, uniform: WGpuHandle) -> WGpuHandle #foreign;
+jsCreateComputePipeline :: (
+    mod: WGpuHandle, entry: *u8, entry_len: s64, bind_group_layout: WGpuHandle,
+) -> WGpuHandle #foreign;
 jsCreateSampler :: () -> WGpuHandle #foreign;
 jsCreateSurface :: (id: *u8, id_len: s64) -> WGpuHandle #foreign;
 jsConfigureSurface :: (surface: WGpuHandle, width: u32, height: u32) -> WGpuHandle #foreign;
@@ -862,12 +1148,15 @@ jsGetPreferredSwapFormat :: (out: *u8, out_cap: s64) -> s64 #foreign;
 jsBeginCommands :: () -> s32 #foreign;
 jsBeginRenderPassToTexture :: (color: WGpuHandle, depth: WGpuHandle, r: float, g: float, b: float, a: float) #foreign;
 jsBeginRenderPassToSurface :: (surface: WGpuHandle, r: float, g: float, b: float, a: float) #foreign;
+jsBeginComputePass :: () #foreign;
 jsSetPipeline :: (pipe: WGpuHandle) #foreign;
 jsSetVertexBuffer :: (slot: u32, buf: WGpuHandle) #foreign;
 jsSetIndexBuffer :: (buf: WGpuHandle) #foreign;
 jsSetBindGroup :: (index: u32, bg: WGpuHandle) #foreign;
 jsDrawIndexed :: (index_count: u32) #foreign;
 jsDraw :: (vertex_count: u32) #foreign;
+jsDispatch :: (groups_x: u32, groups_y: u32, groups_z: u32) #foreign;
 jsEndRenderPass :: () #foreign;
+jsEndComputePass :: () #foreign;
 jsSubmit :: () #foreign;
 jsDestroyHandle :: (handle: WGpuHandle) #foreign;

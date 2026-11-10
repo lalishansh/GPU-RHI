@@ -21,13 +21,6 @@ SlangShaderType :: enum u8 {
     GEOMETRY_SHADER;
 };
 
-SlangResourceKind :: enum u8 {
-    STORAGE_BUFFER;
-    SAMPLED_TEXTURE;
-    STORAGE_TEXTURE;
-    SAMPLER;
-};
-
 SlangResourceBinding :: struct {
     name: string;
     set: u32;
@@ -336,7 +329,7 @@ collect_variable_layout :: (
 
     if category == .UNIFORM || category == .PUSH_CONSTANT_BUFFER || category == .CONSTANT_BUFFER {
         leaf := unwrap_container_type(type);
-        offset := cast(u32) slang.spReflectionVariableLayout_GetOffset(var_layout, category);
+        base_offset := cast(u32) slang.spReflectionVariableLayout_GetOffset(var_layout, category);
 
         set: u32 = VULKAN_UNIFORM_PUSH_CONSTANT;
         binding: u32 = VULKAN_UNIFORM_PUSH_CONSTANT;
@@ -345,10 +338,59 @@ collect_variable_layout :: (
             binding = cast(u32) slang.spReflectionVariableLayout_GetOffset(var_layout, .DESCRIPTOR_TABLE_SLOT);
         }
 
+        // Flatten struct uniforms (e.g. Frame { MVP, LightDir, Ambient }) so Set(shdr.MVP, …)
+        // keeps working and field offsets stay non-overlapping across VS+FS.
+        leaf_kind := slang.spReflectionType_GetKind(leaf);
+        if leaf_kind == .STRUCT {
+            field_count := slang.spReflectionTypeLayout_GetFieldCount(type_layout);
+            // If the var itself is a container, fields live on the element type layout.
+            field_parent := type_layout;
+            if field_count == 0 {
+                elem := slang.spReflectionTypeLayout_GetElementTypeLayout(type_layout);
+                if elem {
+                    field_parent = elem;
+                    field_count = slang.spReflectionTypeLayout_GetFieldCount(field_parent);
+                }
+            }
+            for fi: 0..field_count-1 {
+                field_vl := slang.spReflectionTypeLayout_GetFieldByIndex(field_parent, fi);
+                if !field_vl continue;
+                field_var := slang.spReflectionVariableLayout_GetVariable(field_vl);
+                field_tl := slang.spReflectionVariableLayout_GetTypeLayout(field_vl);
+                if !field_var || !field_tl continue;
+                fname_c := slang.spReflectionVariable_GetName(field_var);
+                if !fname_c continue;
+                fname := copy_string(to_string(fname_c));
+                ftype := slang.spReflectionTypeLayout_GetType(field_tl);
+                foff := base_offset + cast(u32) slang.spReflectionVariableLayout_GetOffset(field_vl, category);
+
+                already := false;
+                for blueprint_uniforms.* {
+                    if it.name == fname {
+                        already = true;
+                        break;
+                    }
+                }
+                if already continue;
+
+                funiform := SlangUniformType.{
+                    name = fname,
+                    type = slang_type_to_type_info(ftype),
+                    offset = foff,
+                    set = set,
+                    binding = binding,
+                    stage_flags = slang_stage_to_vk_flags(entry_stage),
+                };
+                if entry_uniforms then array_add(entry_uniforms, funiform);
+                array_add(blueprint_uniforms, funiform);
+            }
+            return;
+        }
+
         uniform := SlangUniformType.{
             name = name,
             type = slang_type_to_type_info(leaf),
-            offset = offset,
+            offset = base_offset,
             set = set,
             binding = binding,
             stage_flags = slang_stage_to_vk_flags(entry_stage),

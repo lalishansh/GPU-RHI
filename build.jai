@@ -22,6 +22,9 @@ HOST_EXAMPLES :: string.[
     "11_threaded_rendering",
     "12_shader_stages",
     "13_slang_features",
+    "14_cornell_raster",
+    "15_cornell_compute",
+    "16_imgui",
     "rt01_acceleration_structures",
     "rt02_ray_pipelines",
     "rt03_dispatch_rays",
@@ -37,6 +40,18 @@ WEB_EXAMPLES :: string.[
     "05_fill_resources",
     "06_draw_geometry",
     "07_headless",
+    "14_cornell_raster",
+    "15_cornell_compute",
+    "16_imgui",
+];
+
+// Android NativeActivity examples (filter: jai build.jai - android 02_surface install).
+// Default when no filter: 02_surface. APK lib is still named libmain.so (NativeActivity meta-data).
+ANDROID_EXAMPLES :: string.[
+    "02_surface",
+    "14_cornell_raster",
+    "15_cornell_compute",
+    "16_imgui",
 ];
 
 #run {
@@ -71,8 +86,7 @@ WEB_EXAMPLES :: string.[
     if wants_web {
         build_web(args);
     } else if wants_android {
-        log_error("Android target parked until GPU backend rewrite. See FEATURES.md / __temp/.\n");
-        exit(1);
+        build_android(args, target_x64, target_arm, do_install);
     } else {
         build_host(args);
     }
@@ -383,10 +397,35 @@ build_web :: (args: [] string) {
     ]);
 }
 
-build_android :: (target_x64: bool, target_arm: bool, do_install: bool) {
+build_android :: (args: [] string, target_x64: bool, target_arm: bool, do_install: bool) {
     cpu_target := CPU.ARM64;
     if target_x64 cpu_target = .X64;
     if target_arm cpu_target = .ARM64;
+
+    filter := "";
+    for args {
+        if it == "host" || it == "-host" || it == "web" || it == "-web" || it == "android" || it == "-android" continue;
+        if it == "x64" || it == "-x64" || it == "arm64" || it == "-arm64" continue;
+        if it == "install" || it == "-install" continue;
+        if begins_with(it, "-") continue;
+        filter = it;
+        break;
+    }
+    example := "02_surface";
+    if filter.count {
+        matched := false;
+        for ANDROID_EXAMPLES {
+            if it == filter {
+                example = it;
+                matched = true;
+                break;
+            }
+        }
+        if !matched {
+            log_error("No Android example matched filter '%'. Known: %\n", filter, ANDROID_EXAMPLES);
+            exit(1);
+        }
+    }
 
     _, target_triple_with_sdk := get_android_target_triple(cpu_target);
 
@@ -394,7 +433,7 @@ build_android :: (target_x64: bool, target_arm: bool, do_install: bool) {
         android_check_for_adb_and_select_device("to install app to device");
     }
 
-    log("Compiling for ANDROID %", cpu_target);
+    log("Compiling ANDROID % example \"%\"", cpu_target, example);
 
     // Prefer patched modules tree when present (Nix store modules are read-only).
     patched_modules := tprint("%/../../Jai-Compiler/modules", get_working_directory());
@@ -403,7 +442,7 @@ build_android :: (target_x64: bool, target_arm: bool, do_install: bool) {
 
     android_project_config: Android_Project_Config;
     using android_project_config;
-    app_name = ANDROID_APP_NAME;
+    app_name = tprint("% (%)", ANDROID_APP_NAME, example);
     app_id   = ANDROID_APP_ID;
     lib_name = OUTPUT_EXECUTABLE_NAME;
     project_path = tprint("%/AndroidProject", BUILD_DIR);
@@ -422,7 +461,7 @@ build_android :: (target_x64: bool, target_arm: bool, do_install: bool) {
     );
     make_directory_if_it_does_not_exist(build_output_directory, recursive = true);
 
-    w := compiler_create_workspace("Native Android");
+    w := compiler_create_workspace(tprint("Android %", example));
     options := get_build_options(w);
     copy_commonly_propagated_fields(get_build_options(), *options);
     {
@@ -454,8 +493,9 @@ build_android :: (target_x64: bool, target_arm: bool, do_install: bool) {
 
     set_build_options(options, w);
 
+    source := tprint("examples/%/%.jai", example, example);
     compiler_begin_intercept(w);
-    add_build_file("src/main.jai", w);
+    add_build_file(source, w);
 
     while true {
         message := compiler_wait_for_message();
@@ -491,7 +531,7 @@ build_android :: (target_x64: bool, target_arm: bool, do_install: bool) {
     android_options: Android_Build_Options;
     android_options.cpu_target = cpu_target;
     android_options.output_path = OUT_DIR;
-    android_options.output_apk_name = OUTPUT_EXECUTABLE_NAME;
+    android_options.output_apk_name = example; // .bin/<example>.apk; lib inside remains libmain.so
     android_options.shared_library_path = build_output_directory;
     android_options.intermediate_path = tprint("%/android", BUILD_DIR);
     android_options.mode = .ILL_WRITE_IT_AND_WELL_DO_IT_LIVE_FUCKING_THING_SUCKS;

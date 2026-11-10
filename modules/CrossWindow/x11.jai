@@ -212,21 +212,21 @@ x11_push :: (target: *X11Window, e: BaseEvent) {
 }
 
 x11_key_from_keysym :: (ks: KeySym) -> u8 {
-    // Printable ASCII / common controls. Specials left as low KeySym bytes when useful.
-    if ks == XK_BackSpace return 8;
-    if ks == XK_Tab return 9;
-    if ks == XK_Return return 13;
-    if ks == XK_Escape return 27;
-    if ks == XK_Delete return 127;
-    if ks == 32 || ks == XK_KP_Space return 32;
+    // Printable ASCII / common controls. Maps into CrossWindow KEY_* codes.
+    if ks == XK_BackSpace return KEY_BACKSPACE;
+    if ks == XK_Tab return KEY_TAB;
+    if ks == XK_Return return KEY_RETURN;
+    if ks == XK_Escape return KEY_ESCAPE;
+    if ks == XK_Delete return KEY_DELETE;
+    if ks == 32 || ks == XK_KP_Space return KEY_SPACE;
 
     if ks >= XK_F1 && ks <= XK_F12 {
-        return cast(u8) (0x80 + (ks - XK_F1)); // 0x80..0x8B
+        return cast(u8) (KEY_F1 + (ks - XK_F1));
     }
-    if ks == XK_Left  return 0x90;
-    if ks == XK_Up    return 0x91;
-    if ks == XK_Right return 0x92;
-    if ks == XK_Down  return 0x93;
+    if ks == XK_Left  return KEY_LEFT;
+    if ks == XK_Up    return KEY_UP;
+    if ks == XK_Right return KEY_RIGHT;
+    if ks == XK_Down  return KEY_DOWN;
 
     masked := ks & 0xFF;
     if masked >= #char "a" && masked <= #char "z" {

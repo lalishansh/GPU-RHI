@@ -1,8 +1,14 @@
-// CrossWindow + Surface + Present
+// CrossWindow + Surface + Present — host (X11), WASM (canvas), Android (ANativeWindow)
 #if OS == .WASM {
     WINDOW_BACKEND :: WINDOW_TYPE.JS_CANVAS;
+} else #if OS == .ANDROID {
+    WINDOW_BACKEND :: WINDOW_TYPE.ANDROID;
 } else {
     WINDOW_BACKEND :: WINDOW_TYPE.X11;
+}
+
+#if OS == .ANDROID {
+    #import "Android"()(main, USE_GLUE_NATIVE_PORT = true);
 }
 
 #if OS == .WASM {
@@ -43,40 +49,39 @@ surface_main :: () {
     vbo := Buffer(*dev, verts); defer Destroy(*vbo);
     ibo := Buffer(*dev, indices); defer Destroy(*ibo);
 
-    print("Surface %x% ready on CrossWindow(%) — presenting a few frames\n",
+    print("Surface %x% ready on CrossWindow(%) — presenting\n",
         srf.width, srf.height, WINDOW_BACKEND);
 
     frames := 0;
     quit := false;
-    while !quit && frames < 90 {
+    // Host/WASM smoke a fixed frame count; Android runs until quit/background forever.
+    max_frames := 90;
+    #if OS == .ANDROID {
+        max_frames = 0x7FFF_FFFF;
+    }
+    while !quit && frames < max_frames {
+        reset_temporary_storage();
+
         for PollEvents(win) {
-            cat := cast(EVENT_CATEGORY) it.dataU8[0];
-            print("event cat=% (raw=%)\n", cat, it.dataU8[0]);
             if it == .WINDOW_QUIT {
-                print("  WINDOW_QUIT\n");
                 quit = true;
                 break;
             }
             if it == .WINDOW_RESIZE {
                 _, rw, rh := WindowResizeEvent(it);
-                print("  WINDOW_RESIZE %x%\n", rw, rh);
                 if rw > 0 && rh > 0 {
                     Update(*fb, Size2D.{rw, rh});
                 }
             }
-            if it == .WINDOW_FOCUS || it == .WINDOW_FOCUS_LOST || it == .WINDOW_MOVE {
-                print("  window event\n");
-            }
-            if it == .INPUT_KEYBOARD {
-                _, key, action := KeyboardEvent(it);
-                print("  KEY key=% action=%\n", key, cast(u8) action);
-            }
-            if it == .INPUT_MOUSE {
-                _, btn, action, mx, my := MouseEvent(it);
-                print("  MOUSE btn=% action=% @ %,%)\n", cast(u8) btn, cast(u8) action, mx, my);
-            }
         }
         if quit break;
+
+        #if OS == .ANDROID {
+            if win.host == null {
+                sleep_milliseconds(16);
+                continue;
+            }
+        }
 
         q := Queue(*dev, .GRAPHICS);
         Bind(*q, *fb);

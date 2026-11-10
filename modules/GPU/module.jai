@@ -11,6 +11,11 @@
     #if OS == .LINUX {
         X11 :: #import "X11";
     }
+    #if OS == .ANDROID {
+        Android :: #import "Android";
+    }
+    // libslang is host-only. Android APK must not import it (unresolved spReflection* at load).
+    // SPIR-V is baked via #run,host (slangc) when targeting Android.
     #if OS != .ANDROID {
         slang :: #import "slang";
     }
@@ -126,6 +131,14 @@ IndexU32_t :: u32;
 
 VULKAN_UNIFORM_PUSH_CONSTANT :: cast(u32) 0xFFFF_FFFF;
 
+// Shared with slang_reflect (host) and Android host-baked shader member emit.
+SlangResourceKind :: enum u8 {
+    STORAGE_BUFFER;
+    SAMPLED_TEXTURE;
+    STORAGE_TEXTURE;
+    SAMPLER;
+};
+
 UniformDefinition :: struct {
     name: string;
     type: Type;
@@ -188,6 +201,8 @@ ray_tracing_not_ready :: (feature_name: string, loc := #caller_location) {
 #if OS == .WASM {
     #load "webgpu.jai";
 } else {
-    #load "slang_reflect.jai";
+    #if OS != .ANDROID {
+        #load "slang_reflect.jai";
+    }
     #load "vulkan.jai";
 }

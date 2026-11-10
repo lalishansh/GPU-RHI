@@ -644,3 +644,58 @@ void __assert_fail(const char *expr, const char *file, s32 line, const char *fun
     (void)func;
     __builtin_trap();
 }
+
+// C++ static destructors / atexit. No process teardown on wasm — accept and ignore.
+int __cxa_atexit(void (*f)(void *), void *p, void *d) {
+    (void)f;
+    (void)p;
+    (void)d;
+    return 0;
+}
+
+int snprintf(char *buf, u64 size, const char *fmt, ...) {
+    va_list ap;
+    s32 n;
+    va_start(ap, fmt);
+    n = format_into(buf, size, fmt, ap);
+    va_end(ap);
+    return n;
+}
+
+// newlib integer / small sprintf variants pulled in by ImGui.a
+int siprintf(char *buf, const char *fmt, ...) {
+    va_list ap;
+    s32 n;
+    va_start(ap, fmt);
+    n = format_into(buf, (u64)0x7fffffff, fmt, ap);
+    va_end(ap);
+    return n;
+}
+
+int __small_sprintf(char *buf, const char *fmt, ...) {
+    va_list ap;
+    s32 n;
+    va_start(ap, fmt);
+    n = format_into(buf, (u64)0x7fffffff, fmt, ap);
+    va_end(ap);
+    return n;
+}
+
+int toupper(int c) {
+    if (c >= 'a' && c <= 'z') return c - ('a' - 'A');
+    return c;
+}
+
+float atan2f(float y, float x) {
+    double yy = (double)y;
+    double xx = (double)x;
+    double a;
+    if (xx > 0) return (float)atand(yy / xx);
+    if (xx < 0) {
+        a = atand(yy / xx);
+        return (float)(yy >= 0 ? a + 3.14159265358979323846 : a - 3.14159265358979323846);
+    }
+    if (yy > 0) return 1.5707963f;
+    if (yy < 0) return -1.5707963f;
+    return 0;
+}

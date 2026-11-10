@@ -38,6 +38,72 @@ KEY_ACTION :: enum u8 {
     REPEAT  :: 2;
 }
 
+// Cross-platform key codes carried in KeyboardEvent (u8).
+// Printable letters are uppercase ASCII. Specials use the 0x80+ range so they
+// never collide with ASCII. Android AKEYCODE_* values are also accepted by
+// helpers that check both (see examples/_common/cornell.jai).
+KEY_BACKSPACE :: 8;
+KEY_TAB       :: 9;
+KEY_RETURN    :: 13;
+KEY_ESCAPE    :: 27;
+KEY_SPACE     :: 32;
+KEY_DELETE    :: 127;
+
+KEY_A :: #char "A";
+KEY_B :: #char "B";
+KEY_C :: #char "C";
+KEY_D :: #char "D";
+KEY_E :: #char "E";
+KEY_F :: #char "F";
+KEY_G :: #char "G";
+KEY_H :: #char "H";
+KEY_I :: #char "I";
+KEY_J :: #char "J";
+KEY_K :: #char "K";
+KEY_L :: #char "L";
+KEY_M :: #char "M";
+KEY_N :: #char "N";
+KEY_O :: #char "O";
+KEY_P :: #char "P";
+KEY_Q :: #char "Q";
+KEY_R :: #char "R";
+KEY_S :: #char "S";
+KEY_T :: #char "T";
+KEY_U :: #char "U";
+KEY_V :: #char "V";
+KEY_W :: #char "W";
+KEY_X :: #char "X";
+KEY_Y :: #char "Y";
+KEY_Z :: #char "Z";
+
+KEY_F1  :: 0x80;
+KEY_F2  :: 0x81;
+KEY_F3  :: 0x82;
+KEY_F4  :: 0x83;
+KEY_F5  :: 0x84;
+KEY_F6  :: 0x85;
+KEY_F7  :: 0x86;
+KEY_F8  :: 0x87;
+KEY_F9  :: 0x88;
+KEY_F10 :: 0x89;
+KEY_F11 :: 0x8A;
+KEY_F12 :: 0x8B;
+
+KEY_LEFT  :: 0x90;
+KEY_UP    :: 0x91;
+KEY_RIGHT :: 0x92;
+KEY_DOWN  :: 0x93;
+
+// Android KeyEvent keyCode values (passed through as u8 on ANDROID backend).
+KEY_ANDROID_DPAD_UP    :: 19;
+KEY_ANDROID_DPAD_DOWN  :: 20;
+KEY_ANDROID_DPAD_LEFT  :: 21;
+KEY_ANDROID_DPAD_RIGHT :: 22;
+KEY_ANDROID_A :: 29;
+KEY_ANDROID_D :: 32;
+KEY_ANDROID_S :: 47;
+KEY_ANDROID_W :: 51;
+
 MOUSE_BUTTON :: enum u8 {
     LEFT       :: 1;
     MIDDLE     :: 2;
@@ -195,6 +261,8 @@ UserEvent :: (e: BaseEvent) -> *void, u8 {
     #load "x11.jai";
 } else #if OS == .WASM {
     #load "js_canvas.jai";
+} else #if OS == .ANDROID {
+    #load "android.jai";
 } else {
     // Other platforms later.
     CrossWindow :: (wd: u32, ht: u32, name_id := "app", $type: WINDOW_TYPE) -> *void {

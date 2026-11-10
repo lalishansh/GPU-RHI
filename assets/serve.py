@@ -41,9 +41,9 @@ HTML = """<!DOCTYPE html>
 </head>
 <body>
   <div id="wrap">
-    <div id="canvases">
+    <!-- <div id="canvases">
       <canvas id="app" width="800" height="600"></canvas>
-    </div>
+    </div> -->
     <div id="status">loading {example}…</div>
   </div>
   <script src="{example}.js"></script>

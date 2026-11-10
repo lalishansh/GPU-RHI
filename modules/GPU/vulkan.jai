@@ -1,5 +1,5 @@
 // Vulkan host backend — Context → Device → Texture → Buffer → Spawn → Queue →
-// Pass → Submit → Get / Surface → Present (CrossWindow X11).
+// Pass → Submit → Get / Surface → Present (CrossWindow X11 / Android).
 
 MAX_INSTANCE_LAYERS :: 64;
 MAX_PHYSICAL_DEVICES :: 8;
@@ -19,6 +19,26 @@ MAX_QUEUE_FAMILIES :: 16;
     PFN_vkCreateXlibSurfaceKHR :: #type (
         instance: VkInstance,
         pCreateInfo: *VkXlibSurfaceCreateInfoKHR,
+        pAllocator: *VkAllocationCallbacks,
+        pSurface: *VkSurfaceKHR,
+    ) -> VkResult #c_call;
+}
+
+#if OS == .ANDROID {
+    VK_KHR_ANDROID_SURFACE_EXTENSION_NAME :: "VK_KHR_android_surface";
+
+    VkAndroidSurfaceCreateFlagsKHR :: u32;
+
+    VkAndroidSurfaceCreateInfoKHR :: struct {
+        sType:  VkStructureType;
+        pNext:  *void;
+        flags:  VkAndroidSurfaceCreateFlagsKHR;
+        window: *Android.ANativeWindow;
+    }
+
+    PFN_vkCreateAndroidSurfaceKHR :: #type (
+        instance: VkInstance,
+        pCreateInfo: *VkAndroidSurfaceCreateInfoKHR,
         pAllocator: *VkAllocationCallbacks,
         pSurface: *VkSurfaceKHR,
     ) -> VkResult #c_call;
@@ -64,6 +84,8 @@ Context :: (
                 "VK_KHR_xlib_surface",
                 "VK_KHR_wayland_surface",
             ]);
+        } else #if OS == .ANDROID {
+            array_add(*ext_names, VK_KHR_ANDROID_SURFACE_EXTENSION_NAME.data);
         }
     }
 
@@ -216,6 +238,9 @@ Device :: (ctx: *VulkanContext) -> VulkanDevice {
     if (ctx.flags & .ENABLE_TESSELLATION) != 0 {
         enabled_features.tessellationShader = VK_TRUE;
     }
+    // RWTexture2D (slang) declares StorageImage*WithoutFormat; enable for compute examples.
+    enabled_features.shaderStorageImageReadWithoutFormat = VK_TRUE;
+    enabled_features.shaderStorageImageWriteWithoutFormat = VK_TRUE;
     device_create_info.pEnabledFeatures = *enabled_features;
 
     if (ctx.flags & .ENABLE_SURFACE) != 0 {
@@ -970,6 +995,434 @@ Destroy :: (fb: *VulkanFrameBuffer($N, $has_depth)) {
 
 // --- Shader ---
 
+ResourceBinding :: struct {
+    name: string;
+    set: u32;
+    binding: u32;
+    kind: SlangResourceKind;
+};
+
+#if OS == .ANDROID {
+
+// Host-baked SPIR-V (slangc). No libslang in the APK.
+ANDROID_PRESENT_SPIRV_MEMBERS :: #run,host -> string {
+    #import "Basic";
+    #import "String";
+    File :: #import "File";
+    Process :: #import "Process";
+
+    source := #string SLANG
+struct VSOut
+{
+    float4 Pos : SV_POSITION;
+    float2 UV;
+};
+
+[shader("vertex")]
+VSOut vs_fullscreen(uint id : SV_VertexID)
+{
+    float2 uv = float2((id << 1) & 2, id & 2);
+    VSOut o;
+    o.UV = uv;
+    o.Pos = float4(uv * float2(2, 2) + float2(-1, -1), 0, 1);
+    return o;
+}
+
+[[vk::binding(0, 0)]]
+Texture2D src_tex;
+
+[[vk::binding(1, 0)]]
+SamplerState src_samp;
+
+[shader("fragment")]
+float4 fs_fullscreen(VSOut input) : SV_TARGET
+{
+    return src_tex.Sample(src_samp, input.UV);
+}
+SLANG;
+
+    File.make_directory_if_it_does_not_exist(".bin/.build", recursive = true);
+    assert(File.write_entire_file(".bin/.build/present_bake.slang", source), "write present_bake.slang failed");
+    result, stdout, stderr := Process.run_command(
+        "env", "-u", "LD_LIBRARY_PATH",
+        "slangc", ".bin/.build/present_bake.slang",
+        "-target", "spirv", "-fvk-use-entrypoint-name",
+        "-matrix-layout-row-major",
+        "-o", ".bin/.build/present.spv",
+        capture_and_return_output = true,
+    );
+    assert(result.type != .FAILED_TO_LAUNCH, "slangc not found on PATH");
+    assert(result.exit_code == 0, "slangc present failed:\n%\n%", stdout, stderr);
+    data, ok := File.read_entire_file(".bin/.build/present.spv");
+    assert(ok && data.count > 0, "read present.spv failed");
+
+    builder: String_Builder;
+    print_to_builder(*builder, "spirv :: u8.[\n");
+    for i: 0..data.count-1 {
+        print_to_builder(*builder, "%,", data[i]);
+        if (i + 1) % 16 == 0 then print_to_builder(*builder, "\n");
+    }
+    print_to_builder(*builder, "\n];\n");
+    return builder_to_string(*builder);
+}
+
+// UNLIT_COLOR_SLANG (Pos/Color/Normal + MVP push constant) — matches examples/_common/shaders.jai.
+ANDROID_UNLIT_SHADER_MEMBERS :: #run,host -> string {
+    #import "Basic";
+    #import "String";
+    File :: #import "File";
+    Process :: #import "Process";
+
+    source := #string SLANG
+struct Vertex_t {
+    float3 Pos;
+    float3 Color;
+    float3 Normal;
+};
+
+[shader("vertex")]
+float4 vs_main(Vertex_t v, uniform float4x4 MVP, out float3 color : COLOR) : SV_Position {
+    color = v.Color;
+    return mul(MVP, float4(v.Pos, 1.0));
+}
+
+[shader("fragment")]
+float4 fs_main(float3 color : COLOR) : SV_Target {
+    return float4(color, 1.0);
+}
+SLANG;
+
+    File.make_directory_if_it_does_not_exist(".bin/.build", recursive = true);
+    assert(File.write_entire_file(".bin/.build/unlit_bake.slang", source), "write unlit_bake.slang failed");
+    result, stdout, stderr := Process.run_command(
+        "env", "-u", "LD_LIBRARY_PATH",
+        "slangc", ".bin/.build/unlit_bake.slang",
+        "-target", "spirv", "-fvk-use-entrypoint-name",
+        "-matrix-layout-row-major",
+        "-entry", "vs_main", "-stage", "vertex",
+        "-entry", "fs_main", "-stage", "fragment",
+        "-o", ".bin/.build/unlit.spv",
+        capture_and_return_output = true,
+    );
+    assert(result.type != .FAILED_TO_LAUNCH, "slangc not found on PATH");
+    assert(result.exit_code == 0, "slangc unlit failed:\n%\n%", stdout, stderr);
+    data, ok := File.read_entire_file(".bin/.build/unlit.spv");
+    assert(ok && data.count > 0, "read unlit.spv failed");
+
+    MATRIX4_BYTES :: 64;
+    builder: String_Builder;
+    print_to_builder(*builder, "Vertex_t :: struct {\n");
+    print_to_builder(*builder, "    GPU_USAGE :: BUFFER_USAGE.VERTEX;\n");
+    print_to_builder(*builder, "    Pos: Vector3;\n");
+    print_to_builder(*builder, "    Color: Vector3;\n");
+    print_to_builder(*builder, "    Normal: Vector3;\n");
+    print_to_builder(*builder, "};\n\n");
+    print_to_builder(*builder, "MVP :: VulkanShaderUniformDefinition.{\n");
+    print_to_builder(*builder, "    name = \"MVP\",\n");
+    print_to_builder(*builder, "    type = type_of(Matrix4),\n");
+    print_to_builder(*builder, "    offset = 0,\n");
+    print_to_builder(*builder, "    set = VULKAN_UNIFORM_PUSH_CONSTANT,\n");
+    print_to_builder(*builder, "    binding = VULKAN_UNIFORM_PUSH_CONSTANT,\n");
+    print_to_builder(*builder, "    stage_flags = 1,\n");
+    print_to_builder(*builder, "};\n\n");
+    print_to_builder(*builder, "vs_entry :: \"vs_main\";\n");
+    print_to_builder(*builder, "fs_entry :: \"fs_main\";\n");
+    print_to_builder(*builder, "cs_entry :: \"\";\n");
+    print_to_builder(*builder, "hs_entry :: \"\";\n");
+    print_to_builder(*builder, "ds_entry :: \"\";\n");
+    print_to_builder(*builder, "is_compute :: false;\n");
+    print_to_builder(*builder, "is_tessellation :: false;\n");
+    print_to_builder(*builder, "push_constant_bytes :: %;\n\n", MATRIX4_BYTES);
+    print_to_builder(*builder, "resource_bindings :: ResourceBinding.[];\n\n");
+    print_to_builder(*builder, "spirv_raw :: u8.[\n");
+    for i: 0..data.count-1 {
+        print_to_builder(*builder, "%,", data[i]);
+        if (i + 1) % 16 == 0 then print_to_builder(*builder, "\n");
+    }
+    print_to_builder(*builder, "\n];\n");
+    return builder_to_string(*builder);
+}
+
+// LIT_SLANG (MVP + LightDir + Ambient) — matches examples/_common/shaders.jai.
+ANDROID_LIT_SHADER_MEMBERS :: #run,host -> string {
+    #import "Basic";
+    #import "String";
+    File :: #import "File";
+    Process :: #import "Process";
+
+    source := #string SLANG
+struct Vertex_t {
+    float3 Pos;
+    float3 Color;
+    float3 Normal;
+};
+
+struct Frame {
+    float4x4 MVP;
+    float3 LightDir;
+    float Ambient;
+};
+
+[shader("vertex")]
+void vs_main(
+    Vertex_t v,
+    uniform Frame frame,
+    out float4 pos : SV_Position,
+    out float3 color : COLOR,
+    out float3 nrm : NORMAL
+) {
+    pos = mul(frame.MVP, float4(v.Pos, 1.0));
+    color = v.Color;
+    nrm = v.Normal;
+}
+
+[shader("fragment")]
+float4 fs_main(
+    float3 color : COLOR,
+    float3 nrm : NORMAL,
+    uniform Frame frame
+) : SV_Target {
+    float ndotl = saturate(dot(normalize(nrm), normalize(-frame.LightDir)));
+    float3 lit = color * (frame.Ambient + (1.0 - frame.Ambient) * ndotl);
+    return float4(lit, 1.0);
+}
+SLANG;
+
+    File.make_directory_if_it_does_not_exist(".bin/.build", recursive = true);
+    assert(File.write_entire_file(".bin/.build/lit_bake.slang", source), "write lit_bake.slang failed");
+    result, stdout, stderr := Process.run_command(
+        "env", "-u", "LD_LIBRARY_PATH",
+        "slangc", ".bin/.build/lit_bake.slang",
+        "-target", "spirv", "-fvk-use-entrypoint-name",
+        "-matrix-layout-row-major",
+        "-entry", "vs_main", "-stage", "vertex",
+        "-entry", "fs_main", "-stage", "fragment",
+        "-o", ".bin/.build/lit.spv",
+        capture_and_return_output = true,
+    );
+    assert(result.type != .FAILED_TO_LAUNCH, "slangc not found on PATH");
+    assert(result.exit_code == 0, "slangc lit failed:\n%\n%", stdout, stderr);
+    data, ok := File.read_entire_file(".bin/.build/lit.spv");
+    assert(ok && data.count > 0, "read lit.spv failed");
+
+    builder: String_Builder;
+    print_to_builder(*builder, "Vertex_t :: struct {\n");
+    print_to_builder(*builder, "    GPU_USAGE :: BUFFER_USAGE.VERTEX;\n");
+    print_to_builder(*builder, "    Pos: Vector3;\n");
+    print_to_builder(*builder, "    Color: Vector3;\n");
+    print_to_builder(*builder, "    Normal: Vector3;\n");
+    print_to_builder(*builder, "};\n\n");
+    print_to_builder(*builder, "MVP :: VulkanShaderUniformDefinition.{\n");
+    print_to_builder(*builder, "    name = \"MVP\",\n");
+    print_to_builder(*builder, "    type = type_of(Matrix4),\n");
+    print_to_builder(*builder, "    offset = 0,\n");
+    print_to_builder(*builder, "    set = VULKAN_UNIFORM_PUSH_CONSTANT,\n");
+    print_to_builder(*builder, "    binding = VULKAN_UNIFORM_PUSH_CONSTANT,\n");
+    print_to_builder(*builder, "    stage_flags = 1,\n");
+    print_to_builder(*builder, "};\n\n");
+    print_to_builder(*builder, "LightDir :: VulkanShaderUniformDefinition.{\n");
+    print_to_builder(*builder, "    name = \"LightDir\",\n");
+    print_to_builder(*builder, "    type = type_of(Vector3),\n");
+    print_to_builder(*builder, "    offset = 64,\n");
+    print_to_builder(*builder, "    set = VULKAN_UNIFORM_PUSH_CONSTANT,\n");
+    print_to_builder(*builder, "    binding = VULKAN_UNIFORM_PUSH_CONSTANT,\n");
+    print_to_builder(*builder, "    stage_flags = 2,\n");
+    print_to_builder(*builder, "};\n\n");
+    print_to_builder(*builder, "Ambient :: VulkanShaderUniformDefinition.{\n");
+    print_to_builder(*builder, "    name = \"Ambient\",\n");
+    print_to_builder(*builder, "    type = type_of(float),\n");
+    print_to_builder(*builder, "    offset = 76,\n");
+    print_to_builder(*builder, "    set = VULKAN_UNIFORM_PUSH_CONSTANT,\n");
+    print_to_builder(*builder, "    binding = VULKAN_UNIFORM_PUSH_CONSTANT,\n");
+    print_to_builder(*builder, "    stage_flags = 2,\n");
+    print_to_builder(*builder, "};\n\n");
+    print_to_builder(*builder, "vs_entry :: \"vs_main\";\n");
+    print_to_builder(*builder, "fs_entry :: \"fs_main\";\n");
+    print_to_builder(*builder, "cs_entry :: \"\";\n");
+    print_to_builder(*builder, "hs_entry :: \"\";\n");
+    print_to_builder(*builder, "ds_entry :: \"\";\n");
+    print_to_builder(*builder, "is_compute :: false;\n");
+    print_to_builder(*builder, "is_tessellation :: false;\n");
+    print_to_builder(*builder, "push_constant_bytes :: 80;\n\n");
+    print_to_builder(*builder, "resource_bindings :: ResourceBinding.[];\n\n");
+    print_to_builder(*builder, "spirv_raw :: u8.[\n");
+    for i: 0..data.count-1 {
+        print_to_builder(*builder, "%,", data[i]);
+        if (i + 1) % 16 == 0 then print_to_builder(*builder, "\n");
+    }
+    print_to_builder(*builder, "\n];\n");
+    return builder_to_string(*builder);
+}
+
+// CORNELL_COMPUTE_SLANG — storage-texture raycast (matches examples/_common/shaders.jai).
+ANDROID_CORNELL_COMPUTE_MEMBERS :: #run,host -> string {
+    #import "Basic";
+    #import "String";
+    File :: #import "File";
+    Process :: #import "Process";
+
+    source := #string SLANG
+// CORNELL_COMPUTE
+[[format("rgba8")]]
+RWTexture2D<float4> Output;
+
+bool hit_aabb(float3 ro, float3 rd, float3 bmin, float3 bmax, out float tHit, out float3 nrm) {
+    float3 inv = 1.0 / rd;
+    float3 t0 = (bmin - ro) * inv;
+    float3 t1 = (bmax - ro) * inv;
+    float3 tminv = min(t0, t1);
+    float3 tmaxv = max(t0, t1);
+    float tmin = max(max(tminv.x, tminv.y), tminv.z);
+    float tmax = min(min(tmaxv.x, tmaxv.y), tmaxv.z);
+    if (tmax < max(tmin, 0.0)) {
+        tHit = 0.0;
+        nrm = float3(0, 1, 0);
+        return false;
+    }
+    tHit = tmin > 0.0 ? tmin : tmax;
+    if (tHit <= 0.0) {
+        nrm = float3(0, 1, 0);
+        return false;
+    }
+    float3 p = ro + rd * tHit;
+    float3 c = (bmin + bmax) * 0.5;
+    float3 d = (p - c) / max(bmax - bmin, float3(1e-4, 1e-4, 1e-4));
+    float3 a = abs(d);
+    if (a.x > a.y && a.x > a.z) nrm = float3(sign(d.x), 0, 0);
+    else if (a.y > a.z) nrm = float3(0, sign(d.y), 0);
+    else nrm = float3(0, 0, sign(d.z));
+    return true;
+}
+
+[shader("compute")]
+[numthreads(8, 8, 1)]
+void cs_main(
+    uint3 id : SV_DispatchThreadID,
+    uniform float3 CameraPos,
+    uniform float3 CameraFwd
+) {
+    const uint W = 800;
+    const uint H = 600;
+    if (id.x >= W || id.y >= H) return;
+
+    float2 uv = (float2(id.xy) + 0.5) / float2(W, H);
+    uv = uv * 2.0 - 1.0;
+    uv.y = -uv.y;
+    float aspect = float(W) / float(H);
+
+    float3 ro = CameraPos;
+    float3 forward = normalize(CameraFwd);
+    float3 worldUp = float3(0.0, 1.0, 0.0);
+    float3 right = normalize(cross(forward, worldUp));
+    if (dot(right, right) < 1e-6) {
+        right = normalize(cross(forward, float3(0.0, 0.0, 1.0)));
+    }
+    float3 up = cross(right, forward);
+    float3 rd = normalize(forward + right * (uv.x * aspect * 0.7) + up * (uv.y * 0.7));
+
+    float3 lightPos = float3(0.0, 0.92, 0.0);
+    float bestT = 1e9;
+    float3 albedo = float3(0.02, 0.02, 0.03);
+    float3 nrm = float3(0, 1, 0);
+    float emissive = 0.0;
+
+    float t; float3 n;
+    if (hit_aabb(ro, rd, float3(-1,-1.02,-1), float3(1,-0.98,1), t, n) && t < bestT) {
+        bestT = t; albedo = float3(0.75,0.75,0.75); nrm = n; emissive = 0;
+    }
+    if (hit_aabb(ro, rd, float3(-1,0.98,-1), float3(1,1.02,1), t, n) && t < bestT) {
+        bestT = t; albedo = float3(0.75,0.75,0.75); nrm = n; emissive = 0;
+    }
+    if (hit_aabb(ro, rd, float3(-1,-1,-1.02), float3(1,1,-0.98), t, n) && t < bestT) {
+        bestT = t; albedo = float3(0.75,0.75,0.75); nrm = n; emissive = 0;
+    }
+    if (hit_aabb(ro, rd, float3(-1.02,-1,-1), float3(-0.98,1,1), t, n) && t < bestT) {
+        bestT = t; albedo = float3(0.75,0.12,0.12); nrm = n; emissive = 0;
+    }
+    if (hit_aabb(ro, rd, float3(0.98,-1,-1), float3(1.02,1,1), t, n) && t < bestT) {
+        bestT = t; albedo = float3(0.12,0.55,0.12); nrm = n; emissive = 0;
+    }
+    if (hit_aabb(ro, rd, float3(-0.65,-1.0,-0.55), float3(-0.20,0.15,-0.05), t, n) && t < bestT) {
+        bestT = t; albedo = float3(0.85,0.85,0.7); nrm = n; emissive = 0;
+    }
+    if (hit_aabb(ro, rd, float3(0.10,-1.0,-0.10), float3(0.55,-0.35,0.40), t, n) && t < bestT) {
+        bestT = t; albedo = float3(0.7,0.85,0.85); nrm = n; emissive = 0;
+    }
+    if (hit_aabb(ro, rd, float3(-0.35,0.97,-0.25), float3(0.35,0.999,0.25), t, n) && t < bestT) {
+        bestT = t; albedo = float3(1,1,0.9); nrm = n; emissive = 8.0;
+    }
+
+    float3 col = albedo * emissive;
+    if (emissive < 0.01 && bestT < 1e8) {
+        float3 p = ro + rd * bestT;
+        float3 l = normalize(lightPos - p);
+        float ndotl = saturate(dot(normalize(nrm), l));
+        float dist = length(lightPos - p);
+        float atten = 1.0 / (0.4 + dist * dist);
+        col = albedo * (0.08 + 2.5 * ndotl * atten);
+    }
+    Output[id.xy] = float4(col, 1.0);
+}
+SLANG;
+
+    File.make_directory_if_it_does_not_exist(".bin/.build", recursive = true);
+    assert(File.write_entire_file(".bin/.build/cornell_cs_bake.slang", source), "write cornell_cs failed");
+    result, stdout, stderr := Process.run_command(
+        "env", "-u", "LD_LIBRARY_PATH",
+        "slangc", ".bin/.build/cornell_cs_bake.slang",
+        "-target", "spirv", "-fvk-use-entrypoint-name",
+        "-matrix-layout-row-major",
+        "-entry", "cs_main", "-stage", "compute",
+        "-o", ".bin/.build/cornell_cs.spv",
+        capture_and_return_output = true,
+    );
+    assert(result.type != .FAILED_TO_LAUNCH, "slangc not found on PATH");
+    assert(result.exit_code == 0, "slangc cornell compute failed:\n%\n%", stdout, stderr);
+    data, ok := File.read_entire_file(".bin/.build/cornell_cs.spv");
+    assert(ok && data.count > 0, "read cornell_cs.spv failed");
+
+    builder: String_Builder;
+    print_to_builder(*builder, "Vertex_t :: struct {\n");
+    print_to_builder(*builder, "    GPU_USAGE :: BUFFER_USAGE.VERTEX;\n");
+    print_to_builder(*builder, "};\n\n");
+    print_to_builder(*builder, "CameraPos :: VulkanShaderUniformDefinition.{\n");
+    print_to_builder(*builder, "    name = \"CameraPos\",\n");
+    print_to_builder(*builder, "    type = type_of(Vector3),\n");
+    print_to_builder(*builder, "    offset = 0,\n");
+    print_to_builder(*builder, "    set = VULKAN_UNIFORM_PUSH_CONSTANT,\n");
+    print_to_builder(*builder, "    binding = VULKAN_UNIFORM_PUSH_CONSTANT,\n");
+    print_to_builder(*builder, "    stage_flags = 32,\n"); // COMPUTE
+    print_to_builder(*builder, "};\n\n");
+    print_to_builder(*builder, "CameraFwd :: VulkanShaderUniformDefinition.{\n");
+    print_to_builder(*builder, "    name = \"CameraFwd\",\n");
+    print_to_builder(*builder, "    type = type_of(Vector3),\n");
+    print_to_builder(*builder, "    offset = 16,\n");
+    print_to_builder(*builder, "    set = VULKAN_UNIFORM_PUSH_CONSTANT,\n");
+    print_to_builder(*builder, "    binding = VULKAN_UNIFORM_PUSH_CONSTANT,\n");
+    print_to_builder(*builder, "    stage_flags = 32,\n");
+    print_to_builder(*builder, "};\n\n");
+    print_to_builder(*builder, "vs_entry :: \"\";\n");
+    print_to_builder(*builder, "fs_entry :: \"\";\n");
+    print_to_builder(*builder, "cs_entry :: \"cs_main\";\n");
+    print_to_builder(*builder, "hs_entry :: \"\";\n");
+    print_to_builder(*builder, "ds_entry :: \"\";\n");
+    print_to_builder(*builder, "is_compute :: true;\n");
+    print_to_builder(*builder, "is_tessellation :: false;\n");
+    print_to_builder(*builder, "push_constant_bytes :: 32;\n\n");
+    print_to_builder(*builder, "resource_bindings :: ResourceBinding.[\n");
+    print_to_builder(*builder, "    .{ name = \"Output\", set = 0, binding = 0, kind = .STORAGE_TEXTURE },\n");
+    print_to_builder(*builder, "];\n\n");
+    print_to_builder(*builder, "spirv_raw :: u8.[\n");
+    for i: 0..data.count-1 {
+        print_to_builder(*builder, "%,", data[i]);
+        if (i + 1) % 16 == 0 then print_to_builder(*builder, "\n");
+    }
+    print_to_builder(*builder, "\n];\n");
+    return builder_to_string(*builder);
+}
+
+}
+
 VulkanShader :: struct ($source: string, $stages: [] string) {
     device: *VulkanDevice;
     shader_module: VkShaderModule;
@@ -980,17 +1433,22 @@ VulkanShader :: struct ($source: string, $stages: [] string) {
     desc_pool: VkDescriptorPool;
     desc_set: VkDescriptorSet;
     #insert -> string {
-        blueprint := ShaderString(source, "embedded");
-        return emit_vulkan_shader_members(blueprint, stages);
+        #if OS == .ANDROID {
+            if contains(source, "CORNELL_COMPUTE") {
+                return ANDROID_CORNELL_COMPUTE_MEMBERS;
+            }
+            if contains(source, "LightDir") {
+                return ANDROID_LIT_SHADER_MEMBERS;
+            }
+            return ANDROID_UNLIT_SHADER_MEMBERS;
+        } else {
+            blueprint := ShaderString(source, "embedded");
+            return emit_vulkan_shader_members(blueprint, stages);
+        }
     }
 }
 
-ResourceBinding :: struct {
-    name: string;
-    set: u32;
-    binding: u32;
-    kind: SlangResourceKind;
-};
+#if OS != .ANDROID {
 
 emit_vulkan_shader_members :: (shader: ShaderBlueprint, stages: [] string) -> string {
     builder: String_Builder;
@@ -1110,6 +1568,8 @@ emit_vulkan_shader_members :: (shader: ShaderBlueprint, stages: [] string) -> st
 
     return builder_to_string(*builder);
 }
+
+} // OS != .ANDROID (emit_vulkan_shader_members / ShaderString bake)
 
 is_push_constant_meta :: (set: u32, binding: u32) -> bool {
     return set == VULKAN_UNIFORM_PUSH_CONSTANT && binding == VULKAN_UNIFORM_PUSH_CONSTANT;
@@ -1396,9 +1856,17 @@ spawn_compute_pipeline :: (dev: *VulkanDevice, shdr: *$Shader_t) {
     alloc_info.pSetLayouts = *shdr.desc_set_layout;
     vk_check(vkAllocateDescriptorSets(dev.device, *alloc_info, *shdr.desc_set));
 
+    push_range: VkPushConstantRange;
     pipe_layout_info: VkPipelineLayoutCreateInfo;
     pipe_layout_info.setLayoutCount = 1;
     pipe_layout_info.pSetLayouts = *shdr.desc_set_layout;
+    if Shader_t.push_constant_bytes > 0 {
+        push_range.stageFlags = .COMPUTE_BIT;
+        push_range.offset = 0;
+        push_range.size = Shader_t.push_constant_bytes;
+        pipe_layout_info.pushConstantRangeCount = 1;
+        pipe_layout_info.pPushConstantRanges = *push_range;
+    }
     vk_check(vkCreatePipelineLayout(dev.device, *pipe_layout_info, null, *shdr.pipeline_layout));
 
     stage: VkPipelineShaderStageCreateInfo;
@@ -1463,6 +1931,7 @@ VulkanComputeQueue :: struct {
     bound_pipeline_layout: VkPipelineLayout;
     bound_desc_set: VkDescriptorSet;
     storage_bound: bool;
+    bound_storage_tex: *VulkanTexture2D;
 }
 
 VulkanCopyQueue :: struct {
@@ -1507,6 +1976,7 @@ Queue :: (dev: *VulkanDevice, $type: QUEUE_TYPE) -> VulkanComputeQueue
         command_pool = pool,
         cmd = cmd,
         storage_bound = false,
+        bound_storage_tex = null,
     };
 }
 
@@ -1589,6 +2059,7 @@ Pass :: (q: *VulkanComputeQueue, shdr: *VulkanShader($source, $stages)) -> [1] V
     q.bound_pipeline_layout = shdr.pipeline_layout;
     q.bound_desc_set = shdr.desc_set;
     q.storage_bound = false;
+    q.bound_storage_tex = null;
     return .[VulkanComputePass(source, stages).{ queue = q, shader = shdr }];
 }
 
@@ -1616,8 +2087,47 @@ Set :: (pass: VulkanComputePass($source, $stages), buf: *VulkanBuffer) {
     pass.queue.storage_bound = true;
 }
 
+Set :: (pass: VulkanComputePass($source, $stages), tex: *VulkanTexture2D) {
+    assert(tex != null && tex.view && tex.image, "Set(compute texture): invalid texture");
+    assert((tex.usage & .STORAGE) != 0, "Set(compute): texture must have STORAGE usage");
+    shdr := pass.shader;
+    Shader_t :: type_of(shdr.*);
+    #if Shader_t.resource_bindings.count < 1 {
+        #assert false; // Spawn(compute) must reflect at least one storage binding
+    }
+    binding := Shader_t.resource_bindings[0].binding;
+
+    // Discard prior contents — works for UNDEFINED (first frame) and SHADER_READ (after Present).
+    color_range := VkImageSubresourceRange.{.COLOR_BIT, 0, 1, 0, 1};
+    insert_image_memory_barrier(
+        pass.queue.cmd, tex.image,
+        xx 0, .SHADER_WRITE_BIT,
+        .UNDEFINED, .GENERAL,
+        .TOP_OF_PIPE_BIT, .COMPUTE_SHADER_BIT,
+        color_range,
+    );
+
+    img_info: VkDescriptorImageInfo;
+    img_info.imageView = tex.view;
+    img_info.imageLayout = .GENERAL;
+
+    write: VkWriteDescriptorSet;
+    write.dstSet = shdr.desc_set;
+    write.dstBinding = binding;
+    write.descriptorCount = 1;
+    write.descriptorType = .STORAGE_IMAGE;
+    write.pImageInfo = *img_info;
+    vkUpdateDescriptorSets(shdr.device.device, 1, *write, 0, null);
+    pass.queue.storage_bound = true;
+    pass.queue.bound_storage_tex = tex;
+}
+
 Set :: (buf: *VulkanBuffer) #expand {
     Set(`it, buf);
+}
+
+Set :: (tex: *VulkanTexture2D) #expand {
+    Set(`it, tex);
 }
 
 Set :: (buf: *VulkanIndexBuffer($IndexT)) #expand {
@@ -1667,6 +2177,20 @@ Set :: (pass: VulkanGraphicsPass($source, $stages), def: UniformDefinition, val:
     );
 }
 
+Set :: (pass: VulkanComputePass($source, $stages), def: UniformDefinition, val: $T) {
+    assert(is_push_constant(def), "Set(compute uniform): expected push-constant uniform");
+    q := pass.queue;
+    shdr := pass.shader;
+    vkCmdPushConstants(
+        q.cmd,
+        shdr.pipeline_layout,
+        .COMPUTE_BIT,
+        def.offset,
+        xx size_of(T),
+        *val,
+    );
+}
+
 Record :: () #expand {
     Record(`it);
 }
@@ -1702,11 +2226,24 @@ Submit :: (q: *VulkanComputeQueue, groups_x: u32, groups_y: u32 = 1, groups_z: u
     assert(q.cmd != null, "Submit(Compute): queue has no command buffer");
     assert(q.bound_pipeline_layout != null, "Submit(Compute): Pass a compute shader first");
     assert(q.bound_desc_set != null, "Submit(Compute): Pass a compute shader first");
-    assert(q.storage_bound, "Submit(Compute): Set a STORAGE buffer before Submit");
+    assert(q.storage_bound, "Submit(Compute): Set a STORAGE buffer or texture before Submit");
     assert(groups_x >= 1 && groups_y >= 1 && groups_z >= 1, "Submit(Compute): group counts must be >= 1");
 
     vkCmdBindDescriptorSets(q.cmd, .COMPUTE, q.bound_pipeline_layout, 0, 1, *q.bound_desc_set, 0, null);
     vkCmdDispatch(q.cmd, groups_x, groups_y, groups_z);
+
+    // Leave storage textures in TRANSFER_SRC so Present's existing barrier path works.
+    if q.bound_storage_tex {
+        color_range := VkImageSubresourceRange.{.COLOR_BIT, 0, 1, 0, 1};
+        insert_image_memory_barrier(
+            q.cmd, q.bound_storage_tex.image,
+            .SHADER_WRITE_BIT, .TRANSFER_READ_BIT,
+            .GENERAL, .TRANSFER_SRC_OPTIMAL,
+            .COMPUTE_SHADER_BIT, .TRANSFER_BIT,
+            color_range,
+        );
+    }
+
     vk_check(vkEndCommandBuffer(q.cmd));
     submit_work(q.device, q.cmd, wait);
 
@@ -1761,6 +2298,10 @@ VulkanSurface :: struct ($Window_t: Type) {
     delta_time: float64;
 
     surface: VkSurfaceKHR;
+    #if OS == .ANDROID {
+        // ANativeWindow used to create `surface` — rotation/TERM_WINDOW replaces it.
+        android_window: *Android.ANativeWindow;
+    }
     surface_format: VkSurfaceFormatKHR;
     present_mode: VkPresentModeKHR;
     extent: VkExtent2D;
@@ -1819,18 +2360,22 @@ SLANG_CODE
 
 PresentShaderSpirv :: struct {
     #insert -> string {
-        bp := ShaderString(PRESENT_SHADER_SLANG, "present");
-        defer array_free(bp.spirv);
-        assert(bp.spirv.count > 0, "PresentShaderSpirv: empty SPIR-V");
+        #if OS == .ANDROID {
+            return ANDROID_PRESENT_SPIRV_MEMBERS;
+        } else {
+            bp := ShaderString(PRESENT_SHADER_SLANG, "present");
+            defer array_free(bp.spirv);
+            assert(bp.spirv.count > 0, "PresentShaderSpirv: empty SPIR-V");
 
-        builder: String_Builder;
-        print_to_builder(*builder, "spirv :: u8.[\n");
-        for i: 0..bp.spirv.count-1 {
-            print_to_builder(*builder, "%,", bp.spirv[i]);
-            if (i + 1) % 16 == 0 then print_to_builder(*builder, "\n");
+            builder: String_Builder;
+            print_to_builder(*builder, "spirv :: u8.[\n");
+            for i: 0..bp.spirv.count-1 {
+                print_to_builder(*builder, "%,", bp.spirv[i]);
+                if (i + 1) % 16 == 0 then print_to_builder(*builder, "\n");
+            }
+            print_to_builder(*builder, "\n];\n");
+            return builder_to_string(*builder);
         }
-        print_to_builder(*builder, "\n];\n");
-        return builder_to_string(*builder);
     }
 }
 
@@ -1876,6 +2421,93 @@ Surface :: (dev: *VulkanDevice, window: *$Window_t) -> VulkanSurface(Window_t)
     require_feature(dev.vulkan_context, .SURFACE);
     assert(false, "Surface: no specialization for window type % (X11 only for now)", Window_t);
     return .{};
+}
+
+} else #if OS == .ANDROID {
+
+Surface :: (dev: *VulkanDevice, window: *AndroidWindow) -> VulkanSurface(AndroidWindow) {
+    assert(dev && dev.device && dev.vulkan_context, "Surface: invalid device");
+    assert(window != null && window.alive, "Surface(Android): invalid window");
+    require_feature(dev.vulkan_context, .SURFACE);
+
+    host := GetNativeAndroid(window);
+    assert(host != null, "Surface(Android): null ANativeWindow (wait for foreground)");
+
+    srf: VulkanSurface(AndroidWindow);
+    srf.device = dev;
+    srf.window = window;
+    srf.delta_time = 0.0;
+    srf.last_time = seconds_since_init();
+
+    surface_create_android_vk_surface(*srf, host);
+    surface_finish_create(*srf);
+    return srf;
+}
+
+Surface :: (dev: *VulkanDevice, window: *$Window_t) -> VulkanSurface(Window_t)
+    #modify { return Window_t != AndroidWindow; }
+{
+    _ := window;
+    assert(dev && dev.vulkan_context, "Surface: invalid device");
+    require_feature(dev.vulkan_context, .SURFACE);
+    assert(false, "Surface: no specialization for window type % (Android only)", Window_t);
+    return .{};
+}
+
+surface_destroy_vk_surface :: (srf: *VulkanSurface($Window_t)) {
+    surface_destroy_swapchain(srf);
+    if srf.surface && srf.device && srf.device.vulkan_context {
+        vkDestroySurfaceKHR(srf.device.vulkan_context.instance, srf.surface, null);
+        srf.surface = null;
+    }
+    srf.android_window = null;
+    srf.extent = .{};
+    srf.width = 0;
+    srf.height = 0;
+}
+
+surface_create_android_vk_surface :: (srf: *VulkanSurface($Window_t), window: *Android.ANativeWindow) {
+    assert(srf.device && srf.device.device && srf.device.vulkan_context, "android surface: invalid device");
+    assert(window != null, "android surface: null window");
+
+    instance := srf.device.vulkan_context.instance;
+
+    create_android: VkAndroidSurfaceCreateInfoKHR;
+    create_android.sType = .ANDROID_SURFACE_CREATE_INFO_KHR;
+    create_android.window = window;
+
+    create_android_surface: PFN_vkCreateAndroidSurfaceKHR =
+        xx vkGetInstanceProcAddr(instance, "vkCreateAndroidSurfaceKHR");
+    assert(create_android_surface != null, "vkCreateAndroidSurfaceKHR missing");
+    vk_check(create_android_surface(instance, *create_android, null, *srf.surface));
+    srf.android_window = window;
+
+    present_supported: VkBool32;
+    vk_check(vkGetPhysicalDeviceSurfaceSupportKHR(
+        srf.device.physical_device, srf.device.queue_family_index, srf.surface, *present_supported,
+    ));
+    assert(present_supported != 0, "Surface: queue family lacks present support");
+}
+
+// Rotation / TERM+INIT_WINDOW replace ANativeWindow; VkSurfaceKHR must be rebuilt.
+surface_rebind_android_window :: (srf: *VulkanSurface($Window_t), window: *Android.ANativeWindow) {
+    if window == null {
+        surface_destroy_vk_surface(srf);
+        return;
+    }
+    if srf.android_window == window && srf.surface return;
+
+    surface_destroy_vk_surface(srf);
+    surface_create_android_vk_surface(srf, window);
+
+    // surface_finish_create already ran once for pipelines; only recreate swapchain.
+    if srf.render_pass {
+        HostWindow :: #import "Window_Creation";
+        _, _, win_w, win_h := HostWindow.get_dimensions(window, false);
+        if win_w > 0 && win_h > 0 {
+            surface_recreate_swapchain(srf, cast(u32) win_w, cast(u32) win_h);
+        }
+    }
 }
 
 } else {
@@ -2161,11 +2793,16 @@ surface_recreate_swapchain :: (srf: *VulkanSurface($Window_t), width: u32, heigh
     if min_images < caps.minImageCount then min_images = caps.minImageCount;
     if caps.maxImageCount > 0 && min_images > caps.maxImageCount then min_images = caps.maxImageCount;
 
+    // Prefer OPAQUE; Android often only exposes INHERIT.
     composite := VkCompositeAlphaFlagBitsKHR.OPAQUE_BIT_KHR;
     if caps.supportedCompositeAlpha & .OPAQUE_BIT_KHR {
         composite = .OPAQUE_BIT_KHR;
     } else if caps.supportedCompositeAlpha & .INHERIT_BIT_KHR {
         composite = .INHERIT_BIT_KHR;
+    } else if caps.supportedCompositeAlpha & .PRE_MULTIPLIED_BIT_KHR {
+        composite = .PRE_MULTIPLIED_BIT_KHR;
+    } else if caps.supportedCompositeAlpha & .POST_MULTIPLIED_BIT_KHR {
+        composite = .POST_MULTIPLIED_BIT_KHR;
     }
 
     old_swapchain := srf.swapchain;
@@ -2250,14 +2887,53 @@ Present :: (srf: *VulkanSurface($Window_t), tex: *VulkanTexture2D, fps: u32 = 60
     assert(tex && tex.view, "Present: invalid texture");
     assert(srf.window != null && srf.window.alive, "Present: window gone");
 
-    _, _, win_w, win_h, ok := GetDimensions(srf.window);
-    if !ok || win_w == 0 || win_h == 0 {
-        sleep_milliseconds(1);
-        return;
-    }
-    if !srf.swapchain || win_w != srf.extent.width || win_h != srf.extent.height {
-        surface_recreate_swapchain(srf, win_w, win_h);
-        if !srf.swapchain return;
+    win_w: u32 = 0;
+    win_h: u32 = 0;
+
+    #if OS == .ANDROID {
+        // :AndroidLifeCycle — TERM_WINDOW nulls the host; INIT_WINDOW gives a new ANativeWindow.
+        // Recreating a swapchain on a dying ANativeWindow/VkSurfaceKHR crashes Adreno in
+        // vkCreateFramebuffer — tear down and wait instead.
+        HostWindow :: #import "Window_Creation";
+        if srf.window.host == null || srf.window.host == HostWindow.WT.INVALID_WINDOW {
+            surface_destroy_vk_surface(srf);
+            sleep_milliseconds(1);
+            return;
+        }
+
+        _, _, rw, rh, ok := GetDimensions(srf.window);
+        if !ok || rw == 0 || rh == 0 {
+            surface_destroy_vk_surface(srf);
+            sleep_milliseconds(1);
+            return;
+        }
+        win_w = rw;
+        win_h = rh;
+
+        needs_rebind := !srf.surface
+            || srf.android_window != srf.window.host
+            || !srf.swapchain
+            || win_w != srf.extent.width
+            || win_h != srf.extent.height;
+        if needs_rebind {
+            surface_rebind_android_window(srf, srf.window.host);
+            if !srf.swapchain {
+                sleep_milliseconds(1);
+                return;
+            }
+        }
+    } else {
+        _, _, rw, rh, ok := GetDimensions(srf.window);
+        if !ok || rw == 0 || rh == 0 {
+            sleep_milliseconds(1);
+            return;
+        }
+        win_w = rw;
+        win_h = rh;
+        if !srf.swapchain || win_w != srf.extent.width || win_h != srf.extent.height {
+            surface_recreate_swapchain(srf, win_w, win_h);
+            if !srf.swapchain return;
+        }
     }
 
     dev := srf.device;
@@ -2272,7 +2948,11 @@ Present :: (srf: *VulkanSurface($Window_t), tex: *VulkanTexture2D, fps: u32 = 60
         srf.image_available, null, *image_index,
     );
     if acquire == .ERROR_OUT_OF_DATE_KHR {
-        surface_recreate_swapchain(srf, win_w, win_h);
+        #if OS == .ANDROID {
+            surface_rebind_android_window(srf, srf.window.host);
+        } else {
+            surface_recreate_swapchain(srf, win_w, win_h);
+        }
         return;
     }
     assert(acquire == .SUCCESS || acquire == .SUBOPTIMAL_KHR, "AcquireNextImage failed: %", acquire);
@@ -2361,7 +3041,11 @@ Present :: (srf: *VulkanSurface($Window_t), tex: *VulkanTexture2D, fps: u32 = 60
     present.pImageIndices = *image_index;
     present_result := vkQueuePresentKHR(dev.graphics_queue, *present);
     if present_result == .ERROR_OUT_OF_DATE_KHR || present_result == .SUBOPTIMAL_KHR {
-        surface_recreate_swapchain(srf, win_w, win_h);
+        #if OS == .ANDROID {
+            surface_rebind_android_window(srf, srf.window.host);
+        } else {
+            surface_recreate_swapchain(srf, win_w, win_h);
+        }
     } else {
         assert(present_result == .SUCCESS, "Present failed: %", present_result);
     }
